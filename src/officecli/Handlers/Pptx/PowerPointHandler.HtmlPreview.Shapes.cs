@@ -1052,6 +1052,20 @@ public partial class PowerPointHandler
         var prstGeom = spPr?.GetFirstChild<Drawing.PresetGeometry>();
         var preset = prstGeom?.Preset?.HasValue == true ? (prstGeom.Preset.InnerText ?? "straightConnector1") : "straightConnector1";
 
+        // Bent/curved connectors need both axes to draw their perpendicular segment.
+        // When one axis is 0 (degenerate — typical when from=/to= shapes are aligned
+        // horizontally or vertically), the polyline/bezier collapses into a 1-2pt strip
+        // and any arrow marker covers the whole thing, producing a "dot". Degrade to a
+        // straight line in that case so the rendered output stays meaningful.
+        // PowerPoint would route the elbow above/below using connection points, but we
+        // don't compute those — straight is the honest fallback.
+        if ((cx == 0 || cy == 0)
+            && (preset.StartsWith("bentConnector", StringComparison.Ordinal)
+                || preset.StartsWith("curvedConnector", StringComparison.Ordinal)))
+        {
+            preset = "straightConnector1";
+        }
+
         // CONSISTENCY(shape-stroke-unit): stroke-width in pt matches CSS border path (see R3 fix).
         var strokeAttrs = $"stroke=\"{safeColor}\" stroke-width=\"{lineWidth:0.##}pt\" fill=\"none\"{dashAttr}{markerStartAttr}{markerEndAttr}";
 
