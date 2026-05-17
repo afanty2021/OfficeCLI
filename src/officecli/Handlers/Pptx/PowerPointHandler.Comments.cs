@@ -169,11 +169,35 @@ public partial class PowerPointHandler
 
     private static string DeriveInitials(string name)
     {
+        // Pull the first letter/digit from each whitespace-separated token,
+        // skipping leading punctuation. Authors commonly embed email or
+        // handle suffixes ("Author 1 <test@example.com>", "Jane (Acme)"),
+        // and the prior implementation picked up the opening '<' / '(' as
+        // an initial — producing "A1<" or "J(" instead of a useful tag.
         if (string.IsNullOrWhiteSpace(name)) return "?";
         var parts = name.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length == 0) return "?";
-        if (parts.Length == 1) return parts[0].Substring(0, Math.Min(2, parts[0].Length)).ToUpperInvariant();
-        return string.Concat(parts.Take(3).Select(p => char.ToUpperInvariant(p[0])));
+
+        static char? FirstWordChar(string token)
+        {
+            foreach (var ch in token)
+                if (char.IsLetterOrDigit(ch)) return char.ToUpperInvariant(ch);
+            return null;
+        }
+
+        if (parts.Length == 1)
+        {
+            var letters = parts[0].Where(char.IsLetterOrDigit)
+                .Select(char.ToUpperInvariant).Take(2).ToArray();
+            return letters.Length == 0 ? "?" : new string(letters);
+        }
+
+        var picks = parts.Select(FirstWordChar)
+            .Where(c => c.HasValue)
+            .Select(c => c!.Value)
+            .Take(3)
+            .ToArray();
+        return picks.Length == 0 ? "?" : new string(picks);
     }
 
     /// <summary>Resolve a /slide[N]/comment[M] path to (slidePart, comment).</summary>
