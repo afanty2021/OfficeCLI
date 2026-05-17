@@ -34,13 +34,30 @@ public partial class PowerPointHandler
             sb.AppendLine($"=== /slide[{slideNum}] ===");
             // CONSISTENCY(pptx-group-flatten): Descendants<Shape>() walks into
             // GroupShape children; Elements<Shape>() would drop them.
-            var shapes = GetSlide(slidePart).CommonSlideData?.ShapeTree?.Descendants<Shape>() ?? Enumerable.Empty<Shape>();
+            var shapeTree = GetSlide(slidePart).CommonSlideData?.ShapeTree;
+            var shapes = shapeTree?.Descendants<Shape>() ?? Enumerable.Empty<Shape>();
 
             foreach (var shape in shapes)
             {
                 var text = GetShapeText(shape);
                 if (!string.IsNullOrWhiteSpace(text))
                     sb.AppendLine(text);
+            }
+
+            // Table cell text — Descendants<Shape>() does not reach text inside
+            // a:tbl cells (tables are GraphicFrame, not Shape). Emit each cell's
+            // text on its own line so view text mirrors the slide's visible copy.
+            if (shapeTree != null)
+            {
+                foreach (var table in shapeTree.Descendants<Drawing.Table>())
+                {
+                    foreach (var cell in table.Descendants<Drawing.TableCell>())
+                    {
+                        var cellText = GetCellTextWithParagraphBreaks(cell);
+                        if (!string.IsNullOrWhiteSpace(cellText))
+                            sb.AppendLine(cellText);
+                    }
+                }
             }
             sb.AppendLine();
         }
@@ -225,7 +242,12 @@ public partial class PowerPointHandler
             totalCharts += shapeTree.Descendants<GraphicFrame>()
                 .Count(gf => gf.Descendants<DocumentFormat.OpenXml.Drawing.Charts.ChartReference>().Any()
                           || IsExtendedChartFrame(gf));
-            totalShapes += shapes.Count;
+            // CONSISTENCY(stats-table-count): tables are GraphicFrame too — pre-R5
+            // they vanished from totalShapes entirely and cell text was never
+            // word-counted, so a deck whose only content was a 5x5 grid reported
+            // "0 shapes / 0 words".
+            var tables = shapeTree.Descendants<Drawing.Table>().ToList();
+            totalShapes += shapes.Count + tables.Count;
             totalPictures += pictures.Count;
             totalTextBoxes += shapes.Count(s => !IsTitle(s));
 
@@ -241,6 +263,17 @@ public partial class PowerPointHandler
                 var text = GetShapeText(shape);
                 if (!string.IsNullOrWhiteSpace(text))
                     totalWords += text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length;
+            }
+
+            // Count words from table cells (mirror the ViewAsText walk).
+            foreach (var table in tables)
+            {
+                foreach (var cell in table.Descendants<Drawing.TableCell>())
+                {
+                    var cellText = GetCellTextWithParagraphBreaks(cell);
+                    if (!string.IsNullOrWhiteSpace(cellText))
+                        totalWords += cellText.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length;
+                }
             }
 
             // Collect font usage
@@ -318,7 +351,9 @@ public partial class PowerPointHandler
             totalCharts += shapeTree.Descendants<GraphicFrame>()
                 .Count(gf => gf.Descendants<DocumentFormat.OpenXml.Drawing.Charts.ChartReference>().Any()
                           || IsExtendedChartFrame(gf));
-            totalShapes += shapes.Count;
+            // CONSISTENCY(stats-table-count): see ViewAsStats.
+            var tables = shapeTree.Descendants<Drawing.Table>().ToList();
+            totalShapes += shapes.Count + tables.Count;
             totalPictures += pictures.Count;
             totalTextBoxes += shapes.Count(s => !IsTitle(s));
 
@@ -338,6 +373,16 @@ public partial class PowerPointHandler
                         ?? run.RunProperties?.GetFirstChild<Drawing.EastAsianFont>()?.Typeface;
                     if (font != null)
                         fontCounts[font!] = fontCounts.GetValueOrDefault(font!) + 1;
+                }
+            }
+
+            foreach (var table in tables)
+            {
+                foreach (var cell in table.Descendants<Drawing.TableCell>())
+                {
+                    var cellText = GetCellTextWithParagraphBreaks(cell);
+                    if (!string.IsNullOrWhiteSpace(cellText))
+                        totalWords += cellText.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length;
                 }
             }
         }
