@@ -1569,12 +1569,15 @@ public partial class PowerPointHandler
     /// </summary>
     private static string? ReadTransitionDirection(OpenXmlElement transElem)
     {
-        // Slide direction transitions: include direction only when non-default
-        // WipeTransition default is Left; PushTransition default is Left
+        // Slide direction transitions: always surface the direction when it was
+        // explicitly written, even when it matches the schema default ("left"),
+        // so set transition=wipe-left round-trips through Get instead of
+        // collapsing back to the bare "wipe" form. CoverTransition already
+        // expands the direction unconditionally — bring wipe/push in line.
         if (transElem is WipeTransition wipe && wipe.Direction?.HasValue == true)
-            return wipe.Direction.Value == TransitionSlideDirectionValues.Left ? null : MapSlideDirection(wipe.Direction.Value);
+            return MapSlideDirection(wipe.Direction.Value);
         if (transElem is PushTransition push && push.Direction?.HasValue == true)
-            return push.Direction.Value == TransitionSlideDirectionValues.Left ? null : MapSlideDirection(push.Direction.Value);
+            return MapSlideDirection(push.Direction.Value);
         if (transElem is CoverTransition cover && cover.Direction != null)
             return ExpandDirectionAbbreviation(cover.Direction.Value?.ToLowerInvariant());
         if (transElem is PullTransition pull && pull.Direction != null)
