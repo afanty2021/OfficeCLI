@@ -41,7 +41,13 @@ internal static class DrawingEffectsHelper
         };
         var clr = colorBuilder(parts[0]);
         bool colorHasAlpha = clr.GetFirstChild<Drawing.Alpha>() != null;
-        if (hasExplicitOpacity || !colorHasAlpha)
+        // ColorEncodesAlpha: user wrote an 8-digit hex with alpha=FF — the
+        // alpha element is absent from the built color (SanitizeColorForOoxml
+        // drops the redundant 100% alpha child), but the caller's intent was
+        // an explicit "fully opaque" shadow. Suppress the 40% default so the
+        // explicit FF alpha doesn't silently downgrade to 40%.
+        bool colorEncodesAlpha = ColorEncodesExplicitAlpha(parts[0]);
+        if (hasExplicitOpacity || (!colorHasAlpha && !colorEncodesAlpha))
             SetAlphaChild(clr, (int)(opacity * 1000));
         shadow.AppendChild(clr);
         return shadow;
@@ -63,10 +69,27 @@ internal static class DrawingEffectsHelper
         var glow = new Drawing.Glow { Radius = (long)(radiusPt * 12700) };
         var clr = colorBuilder(parts[0]);
         bool colorHasAlpha = clr.GetFirstChild<Drawing.Alpha>() != null;
-        if (hasExplicitOpacity || !colorHasAlpha)
+        bool colorEncodesAlpha = ColorEncodesExplicitAlpha(parts[0]);
+        if (hasExplicitOpacity || (!colorHasAlpha && !colorEncodesAlpha))
             SetAlphaChild(clr, (int)(opacity * 1000));
         glow.AppendChild(clr);
         return glow;
+    }
+
+    /// <summary>
+    /// Returns true when <paramref name="colorInput"/> is an 8-digit hex form
+    /// (CSS #RRGGBBAA or OOXML AARRGGBB) — i.e. the caller explicitly encoded
+    /// an alpha byte. Even when that byte resolves to 0xFF (fully opaque),
+    /// SanitizeColorForOoxml drops the redundant alpha element, so a naive
+    /// "no alpha child → use default 40% / 75%" check would silently override
+    /// the user's "100% opaque" intent. Mirror SanitizeColorForOoxml's
+    /// detection here so shadow/glow honor the explicit encoding.
+    /// </summary>
+    private static bool ColorEncodesExplicitAlpha(string colorInput)
+    {
+        if (string.IsNullOrEmpty(colorInput)) return false;
+        var hex = colorInput.TrimStart('#');
+        return hex.Length == 8 && hex.All(c => char.IsAsciiHexDigit(c));
     }
 
     /// <summary>

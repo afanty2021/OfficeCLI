@@ -920,7 +920,11 @@ public partial class PowerPointHandler
                 var angleDeg = outerShadow.Direction?.HasValue == true ? $"{outerShadow.Direction.Value / 60000.0:0.##}" : "45";
                 var distPt = outerShadow.Distance?.HasValue == true ? $"{outerShadow.Distance.Value / 12700.0:0.##}" : "3";
                 var alphaEl = outerShadow.Descendants<Drawing.Alpha>().FirstOrDefault();
-                var opacity = alphaEl?.Val?.HasValue == true ? $"{alphaEl.Val.Value / 1000.0:0.##}" : "40";
+                // OOXML default: <a:outerShdw> without <a:alpha> is fully opaque
+                // (the shadow inherits the color element's alpha; an absent alpha
+                // means 100%). Defaulting to "40" used to mask explicit
+                // alpha=FF inputs as a 40% shadow on round-trip.
+                var opacity = alphaEl?.Val?.HasValue == true ? $"{alphaEl.Val.Value / 1000.0:0.##}" : "100";
                 node.Format["shadow"] = $"{shadowColor}-{blurPt}-{angleDeg}-{distPt}-{opacity}";
             }
             var glow = activeEffectList.GetFirstChild<Drawing.Glow>();
@@ -929,7 +933,8 @@ public partial class PowerPointHandler
                 var glowColor = ReadColorFromElement(glow) ?? "000000";
                 var radiusPt = glow.Radius?.HasValue == true ? $"{glow.Radius.Value / 12700.0:0.##}" : "8";
                 var glowAlpha = glow.Descendants<Drawing.Alpha>().FirstOrDefault();
-                var glowOpacity = glowAlpha?.Val?.HasValue == true ? $"{glowAlpha.Val.Value / 1000.0:0.##}" : "75";
+                // OOXML default: <a:glow> without <a:alpha> is fully opaque.
+                var glowOpacity = glowAlpha?.Val?.HasValue == true ? $"{glowAlpha.Val.Value / 1000.0:0.##}" : "100";
                 node.Format["glow"] = $"{glowColor}-{radiusPt}-{glowOpacity}";
             }
             var reflEl = activeEffectList.GetFirstChild<Drawing.Reflection>();
