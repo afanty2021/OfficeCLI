@@ -15,6 +15,26 @@ namespace OfficeCli.Handlers;
 
 public partial class ExcelHandler
 {
+    // A1 sqref shape: one or more space-separated single-cell or range
+    // references (relative or absolute, with optional sheet-bare row/col
+    // letters). Reject everything else up front so a conditional-formatting
+    // rule cannot land an `INVALID!REF` literal in the sheet — Excel
+    // refuses to open the file in that state.
+    private static readonly System.Text.RegularExpressions.Regex SqrefShape =
+        new(@"^\$?[A-Z]+\$?[0-9]+(:\$?[A-Z]+\$?[0-9]+)?(\s+\$?[A-Z]+\$?[0-9]+(:\$?[A-Z]+\$?[0-9]+)?)*$",
+            System.Text.RegularExpressions.RegexOptions.Compiled
+            | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    internal static string ValidateSqref(string value, string field)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            throw new ArgumentException($"Invalid {field} '{value}': empty A1 range.");
+        if (!SqrefShape.IsMatch(value.Trim()))
+            throw new ArgumentException(
+                $"Invalid {field} '{value}': expected an A1 reference (e.g. 'A1', 'A1:D10', 'A1 B2:C5').");
+        return value;
+    }
+
     /// <summary>
     /// Validate a sheet name against Excel's rules. Throws ArgumentException
     /// with a clear message on the first rule violation. Rules:
