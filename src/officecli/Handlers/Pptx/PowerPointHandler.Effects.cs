@@ -96,6 +96,23 @@ public partial class PowerPointHandler
     ///   true           — alias for half
     ///   none / false   — remove reflection
     /// </summary>
+    private static bool TryParseReflectionEndPos(string value, out int endPos)
+    {
+        switch (value.ToLowerInvariant())
+        {
+            case "tight": case "small": endPos = 55000; return true;
+            case "true":  case "half":  endPos = 90000; return true;
+            case "full":               endPos = 100000; return true;
+        }
+        if (int.TryParse(value, out var pct) && pct >= 0 && pct <= 100)
+        {
+            endPos = (int)Math.Min((long)pct * 1000, 100000);
+            return true;
+        }
+        endPos = 0;
+        return false;
+    }
+
     private static void ApplyReflection(ShapeProperties spPr, string value)
     {
         var effectList = EnsureEffectList(spPr);
@@ -107,14 +124,13 @@ public partial class PowerPointHandler
             return;
         }
 
-        // endPos controls how much of the shape is reflected
-        int endPos = value.ToLowerInvariant() switch
-        {
-            "tight" or "small" => 55000,
-            "true" or "half"   => 90000,
-            "full"             => 100000,
-            _ => int.TryParse(value, out var pct) ? (int)Math.Min((long)pct * 1000, 100000) : 90000
-        };
+        // endPos controls how much of the shape is reflected. Unknown preset
+        // names (and out-of-range numerics) used to silently degrade to "half"
+        // (90000); flag them with TryApplyReflection's bool return so the
+        // caller can surface the value as unsupported_property instead.
+        if (!TryParseReflectionEndPos(value, out var endPos))
+            throw new ArgumentException(
+                $"Invalid reflection '{value}'. Valid presets: none, tight, small, half, true, full; or a numeric percentage 0-100.");
 
         var reflection = new Drawing.Reflection
         {

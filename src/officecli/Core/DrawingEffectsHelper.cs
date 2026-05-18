@@ -98,13 +98,22 @@ internal static class DrawingEffectsHelper
     /// </summary>
     public static Drawing.Reflection BuildReflection(string value)
     {
-        int endPos = value.ToLowerInvariant() switch
+        // Unknown preset names (and out-of-range numerics) used to silently
+        // fall back to "half" (90000), masking typos. Reject so the caller
+        // surfaces the value rather than writing a no-op effect.
+        int endPos;
+        switch (value.ToLowerInvariant())
         {
-            "tight" or "small" => 55000,
-            "true" or "half" => 90000,
-            "full" => 100000,
-            _ => int.TryParse(value, out var pct) ? (int)Math.Min((long)pct * 1000, 100000) : 90000
-        };
+            case "tight": case "small": endPos = 55000; break;
+            case "true":  case "half":  endPos = 90000; break;
+            case "full":               endPos = 100000; break;
+            default:
+                if (!int.TryParse(value, out var pct) || pct < 0 || pct > 100)
+                    throw new ArgumentException(
+                        $"Invalid 'reflection' value '{value}'. Valid presets: none, tight, small, half, true, full; or a numeric percentage 0-100.");
+                endPos = (int)Math.Min((long)pct * 1000, 100000);
+                break;
+        }
 
         return new Drawing.Reflection
         {
