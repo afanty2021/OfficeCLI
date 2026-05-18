@@ -242,6 +242,20 @@ public static partial class PptxBatchEmitter
                 throw new CliException($"dump path not found: {path} ({ex.Message})") { Code = "path_not_found" };
             }
             EmitSlide(ppt, slideNode, idx, items, ctx);
+            // CONSISTENCY(deferred-link-flush): subtree slide dump must flush
+            // ctx.DeferredLinks before returning, otherwise any `link=slide[N]`
+            // prop on a shape inside the dumped slide is silently dropped from
+            // the output (DeferSlideJumpLink moves it out of the shape's
+            // prop bag into ctx.DeferredLinks expecting the full-doc EmitPptx
+            // tail flush, which the subtree path never reaches).
+            //
+            // Cross-slide targets (e.g. dump /slide[1] when the shape links
+            // to /slide[3]) still emit the set row — replay against a deck
+            // missing the target slide fails with ResolveHyperlinkTarget's
+            // "Slide jump target out of range", which is a clearer error
+            // than silent prop loss.
+            if (ctx.DeferredLinks.Count > 0)
+                items.AddRange(ctx.DeferredLinks);
             return (items, ctx.Unsupported);
         }
 
