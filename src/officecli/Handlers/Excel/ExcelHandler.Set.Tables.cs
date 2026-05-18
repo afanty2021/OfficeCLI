@@ -467,7 +467,9 @@ public partial class ExcelHandler
         // `font.*` appear together, text wins the run payload and font.* supplies
         // the rPr. When only font.* appears (no text), preserve the existing run
         // text and just rebuild rPr.
-        string? newCmtText = properties.TryGetValue("text", out var tVal) ? tVal : null;
+        string? newCmtText = properties.TryGetValue("text", out var tVal)
+            ? OfficeCli.Core.TextEscape.Resolve((tVal ?? string.Empty).Replace("\r\n", "\n"))
+            : null;
         bool hasFontProp = properties.Keys.Any(k =>
             k.StartsWith("font.", StringComparison.OrdinalIgnoreCase));
         if (newCmtText != null || hasFontProp)
