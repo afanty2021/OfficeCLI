@@ -12,7 +12,8 @@ namespace OfficeCli.Handlers;
 
 public partial class PowerPointHandler
 {
-    private string AddShape(string parentPath, int? index, Dictionary<string, string> properties)
+    private string AddShape(string parentPath, int? index, Dictionary<string, string> properties,
+                            string? elementTypeHint = null)
     {
                 // CONSISTENCY(master-layout-shape-edit): a shape parent may be a
                 // slide (/slide[N]) or a master/layout part. Master/layout shapes
@@ -111,7 +112,28 @@ public partial class PowerPointHandler
                         shapeName = "!!" + shapeName;
                 }
 
-                var newShape = CreateTextShape(shapeId, shapeName, text, false);
+                // Classify: explicit `--type textbox` always produces a textbox
+                // (writes <p:cNvSpPr txBox="1"/>). For `--type shape` (and the
+                // legacy default where the dispatch doesn't pass a hint), fall
+                // back to a heuristic: explicit geometry (shape=/preset=/
+                // geometry=/customGeometryXml=) → real shape; bare `text=` →
+                // textbox shorthand; otherwise → real shape (matches the
+                // `--type shape` direct intuition).
+                var hasGeometryProp = properties.ContainsKey("shape")
+                    || properties.ContainsKey("preset")
+                    || properties.ContainsKey("geometry")
+                    || properties.ContainsKey("customGeometryXml");
+                var hasTextProp = properties.ContainsKey("text");
+                // `--type textbox` is the explicit textbox path and always
+                // wins (covers the dump-emitter replay case where text is
+                // split into separate paragraph/run adds, so hasTextProp here
+                // is false). `--type shape` keeps the legacy "text= shorthand"
+                // — bare text with no geometry is still classified as
+                // textbox, since users (and earlier tests) treat that as the
+                // textbox shortcut.
+                bool isTextBoxFlavor = elementTypeHint == "textbox"
+                    || (!hasGeometryProp && hasTextProp);
+                var newShape = CreateTextShape(shapeId, shapeName, text, false, isTextBoxFlavor);
 
                 // CONSISTENCY(font-dotted-alias): mirror Set's font.<attr> aliases
                 // (commit 80fb739e). Without these, `add shape --prop font.name=Arial`

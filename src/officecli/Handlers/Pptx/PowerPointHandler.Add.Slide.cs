@@ -1,14 +1,10 @@
 // Copyright 2025 OfficeCLI (officecli.ai)
 // SPDX-License-Identifier: Apache-2.0
 
-using System.Text.RegularExpressions;
 using DocumentFormat.OpenXml;
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Presentation;
 using OfficeCli.Core;
-using Drawing = DocumentFormat.OpenXml.Drawing;
-using C = DocumentFormat.OpenXml.Drawing.Charts;
-using M = DocumentFormat.OpenXml.Math;
 
 namespace OfficeCli.Handlers;
 
@@ -70,7 +66,7 @@ public partial class PowerPointHandler
                 if (properties.TryGetValue("text", out var contentText))
                 {
                     XmlTextValidator.ValidateOrThrow(contentText, "text");
-                    var textShape = CreateTextShape(nextShapeId++, "Content", contentText, false);
+                    var textShape = CreateTextShape(nextShapeId++, "Content", contentText, false, isTextBox: true);
                     newSlidePart.Slide.CommonSlideData!.ShapeTree!.AppendChild(textShape);
                 }
 

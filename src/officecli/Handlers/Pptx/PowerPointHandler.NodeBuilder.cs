@@ -564,13 +564,22 @@ public partial class PowerPointHandler
         var shapePathSeg = BuildElementPathSegment("shape", shape, shapeIdx);
         var basePath = parentPathPrefix ?? $"/slide[{slideNum}]";
         var shapePath = $"{basePath}/{shapePathSeg}";
+        // `txBox="1"` on <p:cNvSpPr> is the on-disk marker for a dedicated text
+        // container (PowerPoint's "Insert Text Box"). Without it, a shape with a
+        // prstGeom — even with no authored text — is a geometry shape, not a
+        // textbox. Falling back to "textbox" for every non-title/equation/
+        // placeholder collapsed both flavors and broke `add --type shape`
+        // round-trip (Get reported Type="textbox").
+        var isTextBox = shape.NonVisualShapeProperties
+            ?.NonVisualShapeDrawingProperties?.TextBox?.Value == true;
         var node = new DocumentNode
         {
             Path = shapePath,
             Type = isTitle ? "title"
                 : isEquation ? "equation"
                 : isPlaceholder ? "placeholder"
-                : "textbox",
+                : isTextBox ? "textbox"
+                : "shape",
             Text = text,
             Preview = string.IsNullOrEmpty(text) ? name : (text.Length > 50 ? text[..50] + "..." : text)
         };
@@ -1589,15 +1598,22 @@ public partial class PowerPointHandler
         }
     }
 
-    private static Shape CreateTextShape(uint id, string name, string text, bool isTitle)
+    private static Shape CreateTextShape(uint id, string name, string text, bool isTitle, bool isTextBox = false)
     {
         var shape = new Shape();
         var appNvPr = new ApplicationNonVisualDrawingProperties();
         if (isTitle)
             appNvPr.AppendChild(new PlaceholderShape { Type = PlaceholderValues.Title });
+        // OOXML `<p:cNvSpPr txBox="1"/>` is the only on-disk marker that
+        // distinguishes a dedicated text container from a geometry shape that
+        // happens to carry text. Without it, every shape with a prstGeom and
+        // empty/short text is indistinguishable on readback.
+        var cNvSpPr = new NonVisualShapeDrawingProperties();
+        if (isTextBox)
+            cNvSpPr.TextBox = true;
         shape.NonVisualShapeProperties = new NonVisualShapeProperties(
             new NonVisualDrawingProperties { Id = id, Name = name },
-            new NonVisualShapeDrawingProperties(),
+            cNvSpPr,
             appNvPr
         );
         var spPr = new ShapeProperties();

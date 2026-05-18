@@ -82,18 +82,30 @@ public static partial class PptxBatchEmitter
         DeferSlideJumpLink(shapeProps, replayPath, ctx);
 
         // NodeBuilder emits `geometry=rect` for every shape with the implicit
-        // <a:prstGeom prst="rect"/> body — including plain text boxes. Replay
-        // routes any shape carrying `geometry=` through AddShape, which (per
-        // bbe1a0c8) seeds a default outline when the caller picks a geometry
-        // but supplies no explicit fill/line. The result is a round-trip
-        // drift: a clean textbox grows a 1pt black border on every dump+replay.
-        // Strip the rect default for textbox/title sources; explicit `shape`
-        // types keep the geometry so AddShape sees the user's intent.
-        if ((shapeNode.Type == "textbox" || shapeNode.Type == "title")
-            && shapeProps.TryGetValue("geometry", out var geomVal)
+        // <a:prstGeom prst="rect"/> body — including plain text boxes and
+        // bare `--type shape` calls (no styling). Strip the rect default for
+        // textbox/title (they don't "own" a geometry concept, so echoing it
+        // back would attach a shape signal to a textbox on replay) and for
+        // bare default-flavor shapes that carry no other distinguishing
+        // styling. When the source explicitly set fill/line/etc., keep
+        // `geometry=rect` so the replay path sees the same prop bag.
+        if (shapeProps.TryGetValue("geometry", out var geomVal)
             && geomVal.Equals("rect", StringComparison.OrdinalIgnoreCase))
         {
-            shapeProps.Remove("geometry");
+            bool stripRect = shapeNode.Type == "textbox" || shapeNode.Type == "title";
+            if (!stripRect && shapeNode.Type == "shape")
+            {
+                bool hasExplicitStyling =
+                    shapeProps.ContainsKey("fill")
+                    || shapeProps.ContainsKey("gradient")
+                    || shapeProps.ContainsKey("pattern")
+                    || shapeProps.ContainsKey("line")
+                    || shapeProps.ContainsKey("lineWidth")
+                    || shapeProps.ContainsKey("lineDash")
+                    || shapeProps.ContainsKey("opacity");
+                stripRect = !hasExplicitStyling;
+            }
+            if (stripRect) shapeProps.Remove("geometry");
         }
 
         // Emit type matches Add dispatch: "title" / "equation" both reduce to
@@ -106,11 +118,16 @@ public static partial class PptxBatchEmitter
         // (exotic OMath that ToLatex can't render), degrade to a plain textbox
         // emit rather than crash replay.
         bool isEquation = shapeNode.Type == "equation" && shapeProps.ContainsKey("formula");
+        // Preserve the shape/textbox distinction on emit: NodeBuilder's Type
+        // already reflects the on-disk txBox flag, so route by Type rather
+        // than reverse-engineering it from geometry presence (which we may
+        // have just stripped above).
         string emitType = shapeNode.Type switch
         {
             "title" => "shape",
-            "equation" => isEquation ? "equation" : (shapeProps.ContainsKey("geometry") ? "shape" : "textbox"),
-            _ => shapeProps.ContainsKey("geometry") ? "shape" : "textbox",
+            "equation" => isEquation ? "equation" : "shape",
+            "shape" => "shape",
+            _ => "textbox",
         };
 
         items.Add(new BatchItem

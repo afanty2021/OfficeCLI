@@ -137,8 +137,24 @@ public partial class PowerPointHandler
         var paraRuns = para.Elements<Drawing.Run>().ToList();
         var unsupported = new List<string>();
 
-        foreach (var (key, value) in properties)
+        // Order keys so `text` is processed BEFORE run-style props (size /
+        // color / font.* / bold / italic / ...). The text branch in
+        // SetRunOrShapeProperties rebuilds the shape's paragraphs from
+        // scratch whenever the original run count was 0 (empty placeholder)
+        // or the new text contains newlines / tabs — every Drawing.Run
+        // already mutated by an earlier key in the iteration order is then
+        // detached from the tree, and the styling silently disappears. The
+        // post-text refresh below repairs the case where text comes first or
+        // is interleaved with later keys; reordering up-front guarantees the
+        // common dump→replay pattern ("set paragraph text=X, size=48pt,
+        // color=#FFFFFF") lands the styling on the new runs.
+        var orderedKeys = properties.Keys
+            .OrderBy(k => k.Equals("text", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+            .ToList();
+
+        foreach (var key in orderedKeys)
         {
+            var value = properties[key];
             switch (key.ToLowerInvariant())
             {
                 // Schema declares aliases: [alignment, halign] for paragraph.align.
@@ -222,6 +238,28 @@ public partial class PowerPointHandler
                         new Dictionary<string, string> { { key, value } }, paraRuns, shape, slidePart, runContext: true,
                         unsupportedContextHint: ParagraphPropsHint);
                     unsupported.AddRange(runUnsup);
+                    // The `text` case in SetRunOrShapeProperties rebuilds the
+                    // shape's paragraphs from scratch when the original run
+                    // count was 0 (empty placeholder) or when the new text
+                    // spans multiple lines / contains tabs — in either case
+                    // every Drawing.Run captured in paraRuns is detached from
+                    // the tree and any subsequent property write lands on
+                    // orphaned XML. Refresh paraRuns against the live shape
+                    // so the very next key (size / color / font.latin / ...)
+                    // hits the new run instances. Re-resolve via paraIdx so
+                    // dump→replay of an empty title placeholder ("set para
+                    // text=X, size=48pt, color=#FFF") keeps the rPr on the
+                    // run instead of dropping every styling key after text.
+                    if (key.Equals("text", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var refreshed = shape.TextBody?.Elements<Drawing.Paragraph>().ToList()
+                            ?? new List<Drawing.Paragraph>();
+                        if (paraIdx >= 1 && paraIdx <= refreshed.Count)
+                        {
+                            para = refreshed[paraIdx - 1];
+                            paraRuns = para.Elements<Drawing.Run>().ToList();
+                        }
+                    }
                     break;
             }
         }
