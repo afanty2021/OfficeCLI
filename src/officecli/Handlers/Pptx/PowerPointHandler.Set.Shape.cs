@@ -183,26 +183,27 @@ public partial class PowerPointHandler
                     var pProps = para.ParagraphProperties ?? (para.ParagraphProperties = new Drawing.ParagraphProperties());
                     pProps.RemoveAllChildren<Drawing.LineSpacing>();
                     var (lsVal2, lsIsPercent) = SpacingConverter.ParsePptLineSpacing(value);
-                    if (lsIsPercent)
-                        pProps.AppendChild(new Drawing.LineSpacing(
-                            new Drawing.SpacingPercent { Val = lsVal2 }));
-                    else
-                        pProps.AppendChild(new Drawing.LineSpacing(
-                            new Drawing.SpacingPoints { Val = lsVal2 }));
+                    var lnSpc = lsIsPercent
+                        ? new Drawing.LineSpacing(new Drawing.SpacingPercent { Val = lsVal2 })
+                        : new Drawing.LineSpacing(new Drawing.SpacingPoints { Val = lsVal2 });
+                    // CONSISTENCY(schema-order-pptx): pPr children must follow
+                    // CT_TextParagraphProperties order or PowerPoint silently
+                    // drops them. See PowerPointHandler.Helpers.cs.
+                    InsertPPrChild(pProps, lnSpc);
                     break;
                 }
                 case "spacebefore" or "space.before":
                 {
                     var pProps = para.ParagraphProperties ?? (para.ParagraphProperties = new Drawing.ParagraphProperties());
                     pProps.RemoveAllChildren<Drawing.SpaceBefore>();
-                    pProps.AppendChild(new Drawing.SpaceBefore(new Drawing.SpacingPoints { Val = SpacingConverter.ParsePptSpacing(value) }));
+                    InsertPPrChild(pProps, new Drawing.SpaceBefore(new Drawing.SpacingPoints { Val = SpacingConverter.ParsePptSpacing(value) }));
                     break;
                 }
                 case "spaceafter" or "space.after":
                 {
                     var pProps = para.ParagraphProperties ?? (para.ParagraphProperties = new Drawing.ParagraphProperties());
                     pProps.RemoveAllChildren<Drawing.SpaceAfter>();
-                    pProps.AppendChild(new Drawing.SpaceAfter(new Drawing.SpacingPoints { Val = SpacingConverter.ParsePptSpacing(value) }));
+                    InsertPPrChild(pProps, new Drawing.SpaceAfter(new Drawing.SpacingPoints { Val = SpacingConverter.ParsePptSpacing(value) }));
                     break;
                 }
                 case "link":
@@ -277,7 +278,11 @@ public partial class PowerPointHandler
             {
                 case "name":
                     var nvGrpPr = grp.NonVisualGroupShapeProperties?.NonVisualDrawingProperties;
-                    if (nvGrpPr != null) nvGrpPr.Name = value;
+                    if (nvGrpPr != null)
+                    {
+                        Core.XmlTextValidator.ValidateOrThrow(value, "name");
+                        nvGrpPr.Name = value;
+                    }
                     break;
                 case "link":
                     ApplyGroupHyperlink(slidePart, grp, value, grpTooltipValue);
@@ -290,7 +295,11 @@ public partial class PowerPointHandler
                     {
                         var existing = grp.NonVisualGroupShapeProperties?.NonVisualDrawingProperties
                             ?.GetFirstChild<Drawing.HyperlinkOnClick>();
-                        if (existing != null) existing.Tooltip = value;
+                        if (existing != null)
+                        {
+                            Core.XmlTextValidator.ValidateOrThrow(value, "tooltip");
+                            existing.Tooltip = value;
+                        }
                     }
                     break;
                 case "x" or "y" or "width" or "height":
@@ -322,7 +331,7 @@ public partial class PowerPointHandler
                 {
                     var grpSpPr = grp.GroupShapeProperties ?? (grp.GroupShapeProperties = new GroupShapeProperties());
                     var xfrm = grpSpPr.TransformGroup ?? (grpSpPr.TransformGroup = new Drawing.TransformGroup());
-                    xfrm.Rotation = (int)(ParseHelpers.SafeParseDouble(value, "rotation") * 60000);
+                    xfrm.Rotation = (int)(ParseHelpers.SafeParseRotationDegrees(value, "rotation") * 60000);
                     break;
                 }
                 case "fill":
@@ -376,7 +385,11 @@ public partial class PowerPointHandler
             {
                 case "name":
                     var nvCxnPr = cxn.NonVisualConnectionShapeProperties?.NonVisualDrawingProperties;
-                    if (nvCxnPr != null) nvCxnPr.Name = value;
+                    if (nvCxnPr != null)
+                    {
+                        Core.XmlTextValidator.ValidateOrThrow(value, "name");
+                        nvCxnPr.Name = value;
+                    }
                     break;
                 case "x" or "y" or "width" or "height":
                 {
@@ -402,7 +415,6 @@ public partial class PowerPointHandler
                     var (lineColorPart, lineWidthPart, lineDashPart) = SplitCompoundLineValue(value);
                     var spPr = cxn.ShapeProperties ?? (cxn.ShapeProperties = new ShapeProperties());
                     var outline = EnsureOutline(spPr);
-                    var (rgb, _) = ParseHelpers.SanitizeColorForOoxml(lineColorPart);
                     outline.RemoveAllChildren<Drawing.SolidFill>();
                     if (lineWidthPart != null)
                         outline.Width = Core.EmuConverter.ParseLineWidth(lineWidthPart);
@@ -411,8 +423,12 @@ public partial class PowerPointHandler
                         outline.RemoveAllChildren<Drawing.PresetDash>();
                         outline.AppendChild(new Drawing.PresetDash { Val = ParseLineDashValue(lineDashPart) });
                     }
-                    var newFill = new Drawing.SolidFill(
-                        new Drawing.RgbColorModelHex { Val = rgb });
+                    // CONSISTENCY(color-input-scheme): shape line= already routes
+                    // through BuildSolidFill which accepts scheme names (accent1,
+                    // dark1, …) and hex equally; mirror the same surface here so
+                    // a connector accepts the documented vocabulary instead of
+                    // rejecting scheme colors at SanitizeColorForOoxml.
+                    var newFill = BuildSolidFill(lineColorPart);
                     // CT_LineProperties schema: fill → prstDash → ... → headEnd → tailEnd
                     var prstDash = outline.GetFirstChild<Drawing.PresetDash>();
                     if (prstDash != null)
@@ -505,7 +521,7 @@ public partial class PowerPointHandler
                 {
                     var spPr = cxn.ShapeProperties ?? (cxn.ShapeProperties = new ShapeProperties());
                     var xfrm = spPr.Transform2D ?? (spPr.Transform2D = new Drawing.Transform2D());
-                    xfrm.Rotation = (int)(ParseHelpers.SafeParseDouble(value, "rotation") * 60000);
+                    xfrm.Rotation = (int)(ParseHelpers.SafeParseRotationDegrees(value, "rotation") * 60000);
                     break;
                 }
                 case "preset" or "prstgeom" or "shape":
@@ -629,6 +645,60 @@ public partial class PowerPointHandler
         return ApplyShapePropsCore(slidePart, innerShapes[shapeIdx - 1], properties);
     }
 
+    /// <summary>
+    /// Resolve a Shape nested inside a group on a slide and return it
+    /// alongside the owning SlidePart. Used by group-paragraph / group-run
+    /// setters so the dispatch tier can pass control to the existing
+    /// SetParagraphOnShape / SetParagraphRunOnShape helpers without
+    /// duplicating navigation logic.
+    /// </summary>
+    private (SlidePart slidePart, Shape shape) ResolveGroupInnerShape(int slideIdx, int grpIdx, int shapeIdx)
+    {
+        var slideParts = GetSlideParts().ToList();
+        if (slideIdx < 1 || slideIdx > slideParts.Count)
+            throw new ArgumentException($"Slide {slideIdx} not found (total: {slideParts.Count})");
+        var slidePart = slideParts[slideIdx - 1];
+        var shapeTree = GetSlide(slidePart).CommonSlideData?.ShapeTree
+            ?? throw new ArgumentException("Slide has no shape tree");
+        var groups = shapeTree.Elements<GroupShape>().ToList();
+        if (grpIdx < 1 || grpIdx > groups.Count)
+            throw new ArgumentException($"Group {grpIdx} not found (total: {groups.Count})");
+        var grp = groups[grpIdx - 1];
+        var innerShapes = grp.Elements<Shape>().ToList();
+        if (shapeIdx < 1 || shapeIdx > innerShapes.Count)
+            throw new ArgumentException($"Shape {shapeIdx} not found in group {grpIdx} (total: {innerShapes.Count})");
+        return (slidePart, innerShapes[shapeIdx - 1]);
+    }
+
+    /// <summary>
+    /// /slide[N]/group[M]/shape[K]/paragraph[P] — mirrors SetParagraphByPath
+    /// but navigates into a group first.
+    /// </summary>
+    private List<string> SetGroupParagraphByPath(Match m, Dictionary<string, string> properties)
+    {
+        var slideIdx = int.Parse(m.Groups[1].Value);
+        var grpIdx = int.Parse(m.Groups[2].Value);
+        var shapeIdx = int.Parse(m.Groups[3].Value);
+        var paraIdx = int.Parse(m.Groups[4].Value);
+        var (slidePart, shape) = ResolveGroupInnerShape(slideIdx, grpIdx, shapeIdx);
+        return SetParagraphOnShape(slidePart, shape, paraIdx, properties);
+    }
+
+    /// <summary>
+    /// /slide[N]/group[M]/shape[K]/paragraph[P]/run[R] — mirrors
+    /// SetParagraphRunByPath but navigates into a group first.
+    /// </summary>
+    private List<string> SetGroupParagraphRunByPath(Match m, Dictionary<string, string> properties)
+    {
+        var slideIdx = int.Parse(m.Groups[1].Value);
+        var grpIdx = int.Parse(m.Groups[2].Value);
+        var shapeIdx = int.Parse(m.Groups[3].Value);
+        var paraIdx = int.Parse(m.Groups[4].Value);
+        var runIdx = int.Parse(m.Groups[5].Value);
+        var (slidePart, shape) = ResolveGroupInnerShape(slideIdx, grpIdx, shapeIdx);
+        return SetParagraphRunOnShape(slidePart, shape, paraIdx, runIdx, properties);
+    }
+
     private List<string> ApplyShapePropsCore(SlidePart slidePart, Shape shape, Dictionary<string, string> properties)
     {
         // Handle z-order first (changes shape position in tree)
@@ -674,6 +744,27 @@ public partial class PowerPointHandler
                 ApplyMotionPathAnimation(slidePart, shape, motionPathValue);
             if (linkValue != null)
                 ApplyShapeHyperlink(slidePart, shape, linkValue, tooltipValue);
+            else if (tooltipValue != null)
+            {
+                // Standalone tooltip update — apply in place to the existing
+                // hlinkClick on shape and all runs. Previously this was a silent
+                // no-op: set returned "Updated" but the tooltip slot was untouched.
+                // If no hyperlink exists, reject so callers don't believe a
+                // tooltip without a link was stored.
+                Core.XmlTextValidator.ValidateOrThrow(tooltipValue, "tooltip");
+                var shapeHl = shape.NonVisualShapeProperties?.NonVisualDrawingProperties
+                    ?.GetFirstChild<Drawing.HyperlinkOnClick>();
+                var runHls = shape.Descendants<Drawing.Run>()
+                    .Select(r => r.RunProperties?.GetFirstChild<Drawing.HyperlinkOnClick>())
+                    .Where(h => h != null)
+                    .ToList();
+                if (shapeHl == null && runHls.Count == 0)
+                    throw new ArgumentException(
+                        "tooltip requires an existing hyperlink — set 'link' in the same call (e.g. --prop link=https://example.com --prop tooltip=…) " +
+                        "or apply 'link' first, then update 'tooltip' on its own.");
+                if (shapeHl != null) shapeHl.Tooltip = tooltipValue;
+                foreach (var rh in runHls) rh!.Tooltip = tooltipValue;
+            }
 
             GetSlide(slidePart).Save();
             return unsupported;
@@ -698,6 +789,19 @@ public partial class PowerPointHandler
             throw new ArgumentException(
                 $"Animation {animIdx} not found on shape {shapeIdx} (total: {ctns.Count})");
 
+        // Reject schema set:false keys up front. Without this, the merge
+        // loop silently dropped them and Set returned success with the
+        // value unchanged. Schema: presetId / easein / easeout / motionPath
+        // are read-only (Get-only).
+        var readOnlyAnimKeys = new[] { "presetId", "presetid", "easein", "easeout", "motionPath", "motionpath" };
+        foreach (var k in readOnlyAnimKeys)
+        {
+            if (properties.ContainsKey(k))
+                throw new ArgumentException(
+                    $"Animation property '{k}' is read-only (Get-only per schema). " +
+                    "It is derived from the effect preset and cannot be set directly.");
+        }
+
         // Read current animation properties via PopulateAnimationNode, then merge
         // with user-provided overrides, then re-apply via the standard pipeline.
         // Limitation: like Set on /slide/shape with animation=, this replaces ALL
@@ -721,6 +825,18 @@ public partial class PowerPointHandler
         var cls = explicitCls
             ?? suffixCls
             ?? (existing.Format.TryGetValue("class", out var exCls) ? exCls?.ToString() ?? "entrance" : "entrance");
+        // Validate class enum (composite parser silently falls back to entrance).
+        ValidateAnimationClass(cls);
+        // Validate user-supplied duration / delay against the integer-ms schema
+        // contract. We only validate values that came in via this Set call —
+        // values pulled from `existing` are already-stored and were validated
+        // (or originated outside this code path).
+        if (properties.TryGetValue("duration", out var setDurRaw))
+            ValidateAnimationDuration(setDurRaw);
+        else if (properties.TryGetValue("dur", out var setDurRaw2))
+            ValidateAnimationDuration(setDurRaw2);
+        if (properties.TryGetValue("delay", out var setDelayRaw))
+            ValidateAnimationDelay(setDelayRaw);
         var duration = properties.TryGetValue("duration", out var dv) ? dv
             : properties.TryGetValue("dur", out var dv2) ? dv2
             : (existing.Format.TryGetValue("duration", out var ed) ? ed?.ToString() ?? "500" : "500");

@@ -25,7 +25,16 @@ public static partial class PptxBatchEmitter
     /// lands in PR2).
     /// </summary>
     internal sealed record SlideEmitContext(
-        List<UnsupportedWarning> Unsupported);
+        List<UnsupportedWarning> Unsupported)
+    {
+        // Forward slide-jump links (e.g. shape[1] on slide[1] linking to
+        // slide[3]) must replay AFTER every slide is added — otherwise the
+        // `link=slide[N]` prop on shape Add resolves against a deck where
+        // the target slide does not yet exist and ResolveHyperlinkTarget
+        // throws "Slide jump target out of range". Defer those props into
+        // a second set-pass appended at the end of EmitPptx.
+        public List<BatchItem> DeferredLinks { get; } = new();
+    }
 
     /// <summary>
     /// Captured at emit time when a slide carries content we cannot round-trip
@@ -45,6 +54,15 @@ public static partial class PptxBatchEmitter
         var items = new List<BatchItem>();
         var ctx = new SlideEmitContext(new List<UnsupportedWarning>());
 
+        // Clear the target deck's slides FIRST so replay onto a non-empty
+        // target lands on a clean slate. Without this, `add slide` items
+        // append after existing slides while every `add shape parent=/slide[N]`
+        // path still resolves to the original slide[N] — the target ends up
+        // with 2× the slide count (existing + freshly added empties) on each
+        // round-trip. `remove /slide[*]` is a no-op on a deck with 0 slides,
+        // so this is safe for the clean-target case too.
+        items.Add(new BatchItem { Command = "remove", Path = "/slide[*]" });
+
         // Resource parts FIRST — theme, notesMaster, masters, layouts.
         // Order matters: replay's raw-set must overwrite the blank deck's
         // seeded baseline before slide content is added so per-slide
@@ -55,23 +73,104 @@ public static partial class PptxBatchEmitter
         EmitNotesMasterRaw(ppt, items);
         EmitMasterRaw(ppt, items);
         EmitLayoutRaw(ppt, items);
+        // R8-5: emit presentation-level slide dimensions so custom sldSz
+        // round-trips through dump → batch. Previously EmitPptx skipped the
+        // root node entirely; replay always landed on the blank-deck default
+        // (33.87cm × 19.05cm widescreen), silently resizing decks built for
+        // 4:3, A4, custom banners, etc.
+        EmitPresentationProps(ppt, items);
 
         // CONSISTENCY(slide-order): always iterate via the handler's
         // GetSlideParts() (sldIdLst-driven). Walking SlideParts off the
         // package returns parts in zip URI order — `slide12.xml` sorts
         // before `slide3.xml`, scrambling user-visible order.
-        var slideTree = ppt.Get("/");
-        if (slideTree.Children == null) return (items, ctx.Unsupported);
-
-        int slideNum = 0;
-        foreach (var slideNode in slideTree.Children)
+        // CONSISTENCY(emit-skip-on-validate): a non-standard attribute or
+        // element on a single slide must not abort the whole dump. The
+        // OpenXml SDK throws a flat InvalidOperationException ("The element
+        // does not allow the specified attribute.") when its strict-mode
+        // validator catches a foreign/extension attribute (common in vendor
+        // templates: gov_bja_template, 1.pptx, ...). Iterate slides one by
+        // one and surface OOXML validation failures as unsupported_element
+        // warnings instead of crashing the whole dump.
+        var slideCount = ppt.SlideCount;
+        for (int slideNum = 1; slideNum <= slideCount; slideNum++)
         {
-            if (slideNode.Type != "slide") continue;
-            slideNum++;
-            EmitSlide(ppt, slideNode, slideNum, items, ctx);
+            var slidePath = $"/slide[{slideNum}]";
+            // CONSISTENCY(slide-ordinal-stub): every iteration MUST contribute
+            // exactly one `add slide` so subsequent set paths /slide[N+1]/…
+            // resolve to the same N+1 slot on replay. Pre-R5 we just
+            // `continue`d on validation failure, emitting zero items for the
+            // skipped slide — every later set drifted by one slot and
+            // dump → batch on a deck with one bad slide could orphan
+            // hundreds of items.
+            DocumentNode slideNode;
+            int preCount = items.Count;
+            try { slideNode = ppt.Get(slidePath); }
+            catch (Exception ex) when (ex.Message.Contains("does not allow", StringComparison.Ordinal)
+                                    || ex.Message.Contains("not allowed", StringComparison.Ordinal))
+            {
+                ctx.Unsupported.Add(new UnsupportedWarning(
+                    Element: "slide.ooxml_validation",
+                    SlidePath: slidePath,
+                    Reason: ex.Message));
+                items.Add(new BatchItem { Command = "add", Parent = "/", Type = "slide" });
+                continue;
+            }
+            try
+            {
+                EmitSlide(ppt, slideNode, slideNum, items, ctx);
+            }
+            catch (Exception ex) when (ex.Message.Contains("does not allow", StringComparison.Ordinal)
+                                    || ex.Message.Contains("not allowed", StringComparison.Ordinal))
+            {
+                ctx.Unsupported.Add(new UnsupportedWarning(
+                    Element: "slide.ooxml_validation",
+                    SlidePath: slidePath,
+                    Reason: ex.Message));
+                // Roll back partial emits from the failing slide and replace
+                // with a single blank-slide stub to keep ordinals aligned.
+                if (items.Count > preCount)
+                    items.RemoveRange(preCount, items.Count - preCount);
+                items.Add(new BatchItem { Command = "add", Parent = "/", Type = "slide" });
+            }
         }
 
+        // Flush deferred slide-jump link sets — every target slide now exists,
+        // so `ResolveHyperlinkTarget` can map slide[N] to the relationship.
+        if (ctx.DeferredLinks.Count > 0)
+            items.AddRange(ctx.DeferredLinks);
+
         return (items, ctx.Unsupported);
+    }
+
+    // R8-5: emit a single `set /` carrying slideWidth/slideHeight when the
+    // source deck deviates from the blank-baseline 33.87cm × 19.05cm
+    // widescreen. The blank-doc default is hard-coded inside BlankDocCreator,
+    // not surfaced by Get, so we string-compare the canonical FormatEmu
+    // output. EmitPresentationProps is a no-op for the default case to keep
+    // unchanged decks from gaining a spurious item on round-trip.
+    private const string DefaultSlideWidth = "33.87cm";
+    private const string DefaultSlideHeight = "19.05cm";
+
+    private static void EmitPresentationProps(PowerPointHandler ppt, List<BatchItem> items)
+    {
+        DocumentNode root;
+        try { root = ppt.Get("/"); }
+        catch { return; }
+        var props = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (root.Format.TryGetValue("slideWidth", out var wObj) && wObj is string w
+            && !string.Equals(w, DefaultSlideWidth, StringComparison.OrdinalIgnoreCase))
+            props["slideWidth"] = w;
+        if (root.Format.TryGetValue("slideHeight", out var hObj) && hObj is string h
+            && !string.Equals(h, DefaultSlideHeight, StringComparison.OrdinalIgnoreCase))
+            props["slideHeight"] = h;
+        if (props.Count == 0) return;
+        items.Add(new BatchItem
+        {
+            Command = "set",
+            Path = "/",
+            Props = props,
+        });
     }
 
     /// <summary>
@@ -132,10 +231,18 @@ public static partial class PptxBatchEmitter
         // ShapeToNode tags placeholder shapes as plain "textbox"/"title". To
         // emit them as `add placeholder` we cross-reference each shape's cNvPr
         // id with the slide's Query("placeholder") result.
+        // Only index placeholders defined on the slide itself. Query also
+        // returns layout-inherited placeholders (Format["inheritedFrom"]
+        // = "layout") whose ph index/id can collide with auto-assigned
+        // textbox cNvPr ids on the slide (python-pptx starts at 2, layout
+        // ftr/dt/sldNum live at id 2..4) — without this filter, the second
+        // textbox would be misclassified as `ftr` and crash placeholder
+        // type parsing, or silently disappear in dump.
         var placeholderById = new Dictionary<string, DocumentNode>(StringComparer.Ordinal);
         foreach (var ph in ppt.Query("placeholder"))
         {
             if (!ph.Path.StartsWith(slidePath + "/", StringComparison.Ordinal)) continue;
+            if (ph.Format.TryGetValue("inheritedFrom", out var inh) && inh as string == "layout") continue;
             if (ph.Format.TryGetValue("id", out var phId) && phId != null)
                 placeholderById[phId.ToString()!] = ph;
         }
@@ -187,7 +294,7 @@ public static partial class PptxBatchEmitter
                     break;
                 case "picture":
                     ord["picture"] = ord.GetValueOrDefault("picture", 0) + 1;
-                    EmitPicture(ppt, child, slidePath, items, ctx);
+                    EmitPicture(ppt, child, slidePath, $"{slidePath}/picture[{ord["picture"]}]", items, ctx);
                     break;
                 case "chart":
                     ord["chart"] = ord.GetValueOrDefault("chart", 0) + 1;
@@ -221,6 +328,11 @@ public static partial class PptxBatchEmitter
         // surface in the slide subtree's children today (notes live under
         // /slide[N]/notes); PR2 will reach in and emit them.
         EmitNotes(ppt, slidePath, items, ctx);
+
+        // Legacy slide comments — also off the shape tree (SlideCommentsPart).
+        // Emit AFTER notes so the per-slide row order is stable: shapes →
+        // notes → comments, mirroring how a reader would traverse the slide.
+        EmitComments(ppt, slidePath, items, ctx);
     }
 
     // Touch the raw slide XML to find content that has no handler vocabulary

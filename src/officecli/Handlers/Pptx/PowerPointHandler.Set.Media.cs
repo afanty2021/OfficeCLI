@@ -217,7 +217,16 @@ public partial class PowerPointHandler
                     if (!double.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var opacityVal)
                         || double.IsNaN(opacityVal) || double.IsInfinity(opacityVal))
                         throw new ArgumentException($"Invalid 'opacity' value: '{value}'. Expected a finite decimal 0.0-1.0.");
+                    // CONSISTENCY(opacity-clamp): mirror the shape/cell path —
+                    // values in (1, 2) are ambiguous (1.5 as decimal is OOR,
+                    // as percentage would silently become 0.015) so reject
+                    // outright instead of /100-dividing into the alpha=1500
+                    // (≈1.5%) trap.
+                    if (opacityVal > 1.0 && opacityVal < 2.0)
+                        throw new ArgumentException($"Invalid 'opacity' value: '{value}'. Expected 0.0-1.0 as decimal or 2-100 as percent (values in (1, 2) are ambiguous).");
                     if (opacityVal > 1.0) opacityVal /= 100.0;
+                    if (opacityVal < 0.0 || opacityVal > 1.0)
+                        throw new ArgumentException($"Invalid 'opacity' value: '{value}'. Expected 0.0-1.0 (or 0-100 as percent).");
                     var blip = pic.BlipFill?.GetFirstChild<Drawing.Blip>();
                     if (blip != null)
                     {
@@ -230,7 +239,11 @@ public partial class PowerPointHandler
                 case "name":
                 {
                     var nvPr = pic.NonVisualPictureProperties?.NonVisualDrawingProperties;
-                    if (nvPr != null) nvPr.Name = value;
+                    if (nvPr != null)
+                    {
+                        Core.XmlTextValidator.ValidateOrThrow(value, "name");
+                        nvPr.Name = value;
+                    }
                     break;
                 }
                 case "shadow":
@@ -429,6 +442,7 @@ public partial class PowerPointHandler
                 }
                 case "name":
                 {
+                    Core.XmlTextValidator.ValidateOrThrow(value, "name");
                     // Update cNvPr name in Choice
                     var nvGfPr = gf?.ChildElements.FirstOrDefault(e => e.LocalName == "nvGraphicFramePr");
                     var choiceCNvPr = nvGfPr?.ChildElements.FirstOrDefault(e => e.LocalName == "cNvPr");
@@ -546,6 +560,7 @@ public partial class PowerPointHandler
                 }
                 case "name":
                 {
+                    Core.XmlTextValidator.ValidateOrThrow(value, "name");
                     var nvSpPr = sp?.ChildElements.FirstOrDefault(e => e.LocalName == "nvGraphicFramePr")
                               ?? sp?.ChildElements.FirstOrDefault(e => e.LocalName == "nvSpPr");
                     var cNvPr = nvSpPr?.ChildElements.FirstOrDefault(e => e.LocalName == "cNvPr");
@@ -686,6 +701,7 @@ public partial class PowerPointHandler
                     break;
                 }
                 case "name":
+                    Core.XmlTextValidator.ValidateOrThrow(value, "name");
                     oleEl.Name = value;
                     break;
                 case "display":

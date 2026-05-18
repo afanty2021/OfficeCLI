@@ -215,11 +215,15 @@ public partial class PowerPointHandler
                     || properties.TryGetValue("rotate", out cxnRot))
                 {
                     connector.ShapeProperties.Transform2D!.Rotation =
-                        (int)(ParseHelpers.SafeParseDouble(cxnRot, "rotation") * 60000);
+                        (int)(ParseHelpers.SafeParseRotationDegrees(cxnRot, "rotation") * 60000);
                 }
                 connector.ShapeProperties.AppendChild(cxnOutline);
 
                 InsertAtPosition(cxnShapeTree, connector, index);
+                if (properties.TryGetValue("zorder", out var cxnZ)
+                    || properties.TryGetValue("z-order", out cxnZ)
+                    || properties.TryGetValue("order", out cxnZ))
+                    ApplyZOrder(cxnSlidePart, connector, cxnZ);
                 GetSlide(cxnSlidePart).Save();
 
                 return $"/slide[{cxnSlideIdx}]/{BuildElementPathSegment("connector", connector, cxnShapeTree.Elements<ConnectionShape>().Count())}";
@@ -308,7 +312,25 @@ public partial class PowerPointHandler
 
                 // Parse shape paths to group: shapes="1,2,3" (shape indices)
                 if (!properties.TryGetValue("shapes", out var shapesStr))
-                    throw new ArgumentException("'shapes' property required: comma-separated shape indices to group (e.g. shapes=1,2,3)");
+                {
+                    // CONSISTENCY(dump-replay-empty-group): dump emits
+                    // `add group` (geometry only) followed by per-child
+                    // `add shape parent=/slide/group[K]`. Without an empty-
+                    // group mode here, dump-replay would lose every group.
+                    // Required props: at least one of the geometry markers
+                    // so this stays distinguishable from a mis-typed 'shapes'
+                    // call ('groups must group something' was the old
+                    // intent — that's still the message when geometry is
+                    // also absent).
+                    bool hasGeometry =
+                        properties.ContainsKey("x") || properties.ContainsKey("y")
+                        || properties.ContainsKey("width") || properties.ContainsKey("height")
+                        || properties.ContainsKey("cx") || properties.ContainsKey("cy");
+                    if (!hasGeometry)
+                        throw new ArgumentException("'shapes' property required: comma-separated shape indices to group (e.g. shapes=1,2,3), or supply geometry (x,y,width,height) for an empty group to be filled by subsequent `add shape parent=/slide[N]/group[K]` calls.");
+
+                    return AddEmptyGroup(grpSlidePart, grpShapeTree, grpSlideIdx, grpId, grpName, index, properties);
+                }
 
                 // CONSISTENCY(query-path-roundtrip): help advertises @id=/@name=
                 // path forms for shapes=; query shape returns @id form. Resolve
@@ -476,6 +498,11 @@ public partial class PowerPointHandler
                     ApplyGroupHyperlink(grpSlidePart, groupShape, grpLinkVal, grpTipVal);
                 }
 
+                if (properties.TryGetValue("zorder", out var grpZ)
+                    || properties.TryGetValue("z-order", out grpZ)
+                    || properties.TryGetValue("order", out grpZ))
+                    ApplyZOrder(grpSlidePart, groupShape, grpZ);
+
                 GetSlide(grpSlidePart).Save();
 
                 var grpCount = grpShapeTree.Elements<GroupShape>().Count();
@@ -486,6 +513,55 @@ public partial class PowerPointHandler
                 return resultPath;
     }
 
+
+    /// <summary>
+    /// Create an empty <p:grpSp> on the slide so subsequent
+    /// `add shape parent=/slide[N]/group[K]` calls have a container to
+    /// attach to. Path back: /slide[N]/group[K] (1-based, positional within
+    /// the slide's group list — same convention as the populated-group
+    /// branch). Required for `dump | batch` round-trip: dump emits a
+    /// geometry-only group followed by per-child shape adds.
+    /// </summary>
+    private string AddEmptyGroup(SlidePart grpSlidePart, ShapeTree grpShapeTree, int grpSlideIdx,
+                                 uint grpId, string grpName, int? index,
+                                 Dictionary<string, string> properties)
+    {
+        long emptyX = (properties.TryGetValue("x", out var ex) || properties.TryGetValue("left", out ex)) ? ParseEmu(ex) : 0;
+        long emptyY = (properties.TryGetValue("y", out var ey) || properties.TryGetValue("top", out ey)) ? ParseEmu(ey) : 0;
+        long emptyCx = (properties.TryGetValue("width", out var ew) || properties.TryGetValue("cx", out ew)) ? ParseEmu(ew) : 0;
+        long emptyCy = (properties.TryGetValue("height", out var eh) || properties.TryGetValue("cy", out eh)) ? ParseEmu(eh) : 0;
+
+        var groupShape = new GroupShape();
+        groupShape.NonVisualGroupShapeProperties = new NonVisualGroupShapeProperties(
+            new NonVisualDrawingProperties { Id = grpId, Name = grpName },
+            new NonVisualGroupShapeDrawingProperties(),
+            new ApplicationNonVisualDrawingProperties()
+        );
+        groupShape.GroupShapeProperties = new GroupShapeProperties(
+            new Drawing.TransformGroup(
+                new Drawing.Offset { X = emptyX, Y = emptyY },
+                new Drawing.Extents { Cx = emptyCx, Cy = emptyCy },
+                new Drawing.ChildOffset { X = emptyX, Y = emptyY },
+                new Drawing.ChildExtents { Cx = emptyCx, Cy = emptyCy }
+            )
+        );
+
+        InsertAtPosition(grpShapeTree, groupShape, index);
+
+        if (properties.TryGetValue("link", out var emptyLink) && !string.IsNullOrEmpty(emptyLink))
+        {
+            var emptyTip = properties.GetValueOrDefault("tooltip");
+            ApplyGroupHyperlink(grpSlidePart, groupShape, emptyLink, emptyTip);
+        }
+        if (properties.TryGetValue("zorder", out var emptyZ)
+            || properties.TryGetValue("z-order", out emptyZ)
+            || properties.TryGetValue("order", out emptyZ))
+            ApplyZOrder(grpSlidePart, groupShape, emptyZ);
+
+        GetSlide(grpSlidePart).Save();
+        var emptyCount = grpShapeTree.Elements<GroupShape>().Count();
+        return $"/slide[{grpSlideIdx}]/group[{emptyCount}]";
+    }
 
     // CONSISTENCY(add-dispatch-shape): mirrors AddGroup/AddShape resolution flow.
     // Emits a <p:sp> with <p:ph type="..."/> that binds to the layout's matching
@@ -643,8 +719,9 @@ public partial class PowerPointHandler
         );
         if (properties.TryGetValue("text", out var phText) && phText.Length > 0)
         {
+            XmlTextValidator.ValidateOrThrow(phText, "text");
             // Accept both literal backslash-n (typical shell escape) and real LF.
-            var lines = phText.Replace("\\n", "\n").Split('\n');
+            var lines = OfficeCli.Core.TextEscape.Resolve(phText).Split('\n');
             foreach (var line in lines)
             {
                 var p = new Drawing.Paragraph();
@@ -672,6 +749,10 @@ public partial class PowerPointHandler
         shape.TextBody = textBody;
 
         InsertAtPosition(phShapeTree, shape, index);
+        if (properties.TryGetValue("zorder", out var phZ)
+            || properties.TryGetValue("z-order", out phZ)
+            || properties.TryGetValue("order", out phZ))
+            ApplyZOrder(phSlidePart, shape, phZ);
         GetSlide(phSlidePart).Save();
 
         var shapeCount = phShapeTree.Elements<Shape>().Count();
@@ -701,12 +782,29 @@ public partial class PowerPointHandler
                 var (effectStripped, suffixCls) = ParseEffectClassSuffix(effect);
                 effect = effectStripped;
                 var cls = explicitCls ?? suffixCls ?? "entrance";
+                // Validate class enum up front — composite animValue parsing
+                // silently falls back to entrance on unknown class tokens
+                // (stderr warning only), so callers got success + wrong cls.
+                // Mirror the hard-reject pattern used for trigger / effect.
+                ValidateAnimationClass(cls);
                 // CONSISTENCY(animation-dur-alias): accept "dur" as alias for
                 // "duration" — mirrors the short name used elsewhere (transition
                 // dur attribute) and matches user intuition.
                 var duration = properties.GetValueOrDefault("duration")
                     ?? properties.GetValueOrDefault("dur", "500");
+                // OOXML @dur is ST_PositiveUniversalMeasure (>= 0). Schema declares
+                // duration as integer ms — reject unit suffixes (500ms), fractions
+                // (500.7), non-numeric garbage, and bare negatives. The composite
+                // animValue parser would silently default these to 400 with a
+                // stderr-only warning.
+                ValidateAnimationDuration(duration);
                 var trigger = properties.GetValueOrDefault("trigger", "onclick");
+
+                // Validate delay symmetrically with duration. The composite
+                // animValue split('-') silently drops the minus sign on a
+                // negative delay token, leaving delay=0 with no error.
+                if (properties.TryGetValue("delay", out var rawDelay))
+                    ValidateAnimationDelay(rawDelay);
 
                 // Map trigger property to animation format
                 var triggerPart = trigger.ToLowerInvariant() switch
@@ -1048,9 +1146,10 @@ public partial class PowerPointHandler
 
                 var created = GenericXmlQuery.TryCreateTypedElement(fbParent, type, properties, index);
                 if (created == null)
-                    throw new ArgumentException($"Unknown element type '{type}' for {parentPath}. " +
+                    throw new CliException($"Unknown element type '{type}' for {parentPath}. " +
                         "Valid types: slide, shape, textbox, picture, table, chart, ole (object, embed), paragraph, run, connector, group, video, audio, equation, notes, zoom. " +
-                        "Use 'officecli pptx add' for details.");
+                        "Use 'officecli pptx add' for details.")
+                        { Code = "invalid_type" };
 
                 GetSlide(fbSlidePart).Save();
 

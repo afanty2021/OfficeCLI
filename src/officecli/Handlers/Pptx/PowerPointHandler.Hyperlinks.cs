@@ -93,6 +93,11 @@ public partial class PowerPointHandler
             throw new ArgumentException(
                 $"Invalid hyperlink URL '{url}'. Expected an absolute URI (e.g. 'https://example.com'), " +
                 $"'slide[N]', or a named action (firstslide/lastslide/nextslide/previousslide/endshow).");
+        // CONSISTENCY(hyperlink-scheme-allowlist): reject javascript:, file:,
+        // data:, vbscript:, … before they reach the relationships file.
+        // Mirrored in ExcelHandler.Set.cs cell link + WordHandler.Set.Element.cs
+        // run/hyperlink writers; ppaction:// URIs are accepted (allowlisted).
+        Core.HyperlinkUriValidator.RequireSafeScheme(url, "link");
         var extRel = slidePart.AddHyperlinkRelationship(uri, isExternal: true);
         return new HyperlinkTarget { Id = extRel.Id, IsExternal = true };
     }
@@ -105,7 +110,18 @@ public partial class PowerPointHandler
         if (!string.IsNullOrEmpty(target.Action))
             hlink.Action = target.Action;
         if (!string.IsNullOrEmpty(tooltip))
+        {
+            // Tooltip becomes an attribute value in the saved part XML. Without
+            // a guard here, codepoints outside XML 1.0 character data (e.g.
+            // U+0007 BEL) escape unrejected and surface as a raw XmlException
+            // at PackageProperties.Save() — the catch site then poisons the
+            // open package and the next Close writes an empty file over the
+            // user's deck. Mirror Add.Text / Add.Shape: validate at the write
+            // boundary so the caller sees an `invalid_value` CliException
+            // instead of an opaque OOXML save failure.
+            Core.XmlTextValidator.ValidateOrThrow(tooltip, "tooltip");
             hlink.Tooltip = tooltip;
+        }
         return hlink;
     }
 
@@ -264,7 +280,14 @@ public partial class PowerPointHandler
         try
         {
             var rel = part.HyperlinkRelationships.FirstOrDefault(r => r.Id == id);
-            if (rel?.Uri != null) return rel.Uri.ToString();
+            // Prefer Uri.OriginalString over Uri.ToString(): ToString() normalises
+            // path-empty URIs by injecting a "/" before the query (so
+            // https://example.com round-trips as https://example.com/, and
+            // ppaction://hlinkshowjump?jump=firstslide as
+            // ppaction://hlinkshowjump/?jump=firstslide). OriginalString preserves
+            // the exact form the user supplied at Add/Set time, matching how
+            // PowerPoint persists rels/*.rels Target= verbatim.
+            if (rel?.Uri != null) return rel.Uri.OriginalString;
             // Internal slide-jump: relationship is to another SlidePart, not a hyperlink relationship
             if (part is SlidePart sp)
             {

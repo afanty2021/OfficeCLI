@@ -37,6 +37,20 @@ public static partial class PptxBatchEmitter
         // node, not slide-level — they roll up into a single root `set /`
         // bag in PR2 (or are already set on the blank-doc baseline).
         "defaultFont",
+        // Slide `layoutType` is a derived Get-side descriptor (resolved from
+        // the slide's layout relationship — "title", "twoContent", …). Replay
+        // drives layout selection via `layout=<name>`; emitting layoutType
+        // additionally would surface as UNSUPPORTED on AddSlide and confuse
+        // users into thinking the slide lost something.
+        "layoutType",
+        // Speaker notes text is surfaced on the slide Format bag by
+        // NodeBuilder, but AddSlide doesn't accept a `notes=` prop —
+        // notes are replayed by EmitNotes as a separate add-paragraph
+        // sequence under /slide[N]/notes. Without this filter, every
+        // emitted slide carries a `notes=...` prop that AddSlide reports
+        // as UNSUPPORTED, flipping the per-item success to false and
+        // (per pre-R6 contract) the batch-level success too.
+        "notes",
     };
 
     private static Dictionary<string, string> FilterEmittableProps(Dictionary<string, object?> raw)
@@ -68,6 +82,35 @@ public static partial class PptxBatchEmitter
             else if (fillVal.Equals("pattern", StringComparison.OrdinalIgnoreCase) && result.ContainsKey("pattern"))
                 result.Remove("fill");
         }
+
+        // Slide background="image" is a Get-side type marker — the embedded
+        // image part is not surfaced as a re-importable path, so replay would
+        // try to parse "image" as a color and reject. Drop the marker; the
+        // slide will replay with default (inherited) background until image-
+        // background round-trip is implemented end-to-end.
+        if (result.TryGetValue("background", out var bgVal)
+            && bgVal.Equals("image", StringComparison.OrdinalIgnoreCase))
+            result.Remove("background");
+
+        // Merge transitionSpeed into transition as a compound form
+        // (e.g. `transition=fade` + `transitionSpeed=slow` → `transition=fade-slow`).
+        // AddSlide/ApplyTransition only honor the compound form; emitting them
+        // as two separate props would drop the speed on replay.
+        if (result.TryGetValue("transitionSpeed", out var spd) && spd.Length > 0)
+        {
+            if (result.TryGetValue("transition", out var trans) && trans.Length > 0)
+                result["transition"] = $"{trans}-{spd}";
+            result.Remove("transitionSpeed");
+        }
+
+        // Shape image="true" is a NodeBuilder marker emitted for shapes
+        // carrying a blipFill — Add has no shape-fill image importer, so
+        // pass-through would fail prop validation. Mirror the
+        // background="image" filter above; the shape replays with default
+        // fill until shape image-fill round-trip is implemented.
+        if (result.TryGetValue("image", out var imgVal)
+            && imgVal.Equals("true", StringComparison.OrdinalIgnoreCase))
+            result.Remove("image");
 
         return result;
     }

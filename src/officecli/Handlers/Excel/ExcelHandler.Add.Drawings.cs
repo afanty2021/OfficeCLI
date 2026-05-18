@@ -486,6 +486,8 @@ public partial class ExcelHandler
                 }
                 else
                 {
+                    // CONSISTENCY(hyperlink-scheme-allowlist).
+                    Core.HyperlinkUriValidator.RequireSafeScheme(picHlink, "link");
                     var hlUri = new Uri(picHlink, UriKind.RelativeOrAbsolute);
                     var hlRel = picDrawingsPart.AddHyperlinkRelationship(hlUri, isExternal: true);
                     hlClick = new Drawing.HyperlinkOnClick { Id = hlRel.Id };
@@ -705,7 +707,7 @@ public partial class ExcelHandler
         }
         var txBody = new XDR.TextBody(bodyPr, new Drawing.ListStyle());
 
-        var lines = shpText.Replace("\\n", "\n").Split('\n');
+        var lines = OfficeCli.Core.TextEscape.Resolve(shpText).Split('\n');
         foreach (var line in lines)
         {
             var rPr = new Drawing.RunProperties { Language = "en-US" };

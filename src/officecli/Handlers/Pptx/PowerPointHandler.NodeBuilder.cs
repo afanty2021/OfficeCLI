@@ -13,6 +13,38 @@ namespace OfficeCli.Handlers;
 
 public partial class PowerPointHandler
 {
+    // CONSISTENCY(effect-color-8digit): shadow/glow readback contract is
+    // CSS-form 8-digit hex '#RRGGBBAA' (schema/help/pptx/shape.json
+    // shadow.readback / glow.readback). FormatHexWithAlpha falls back to
+    // 6-digit when the underlying srgbClr has no a:alpha child, which broke
+    // the round-trip promise for the opaque case. Coerce hex colors emitted
+    // into the composite shadow/glow strings to 8-digit; scheme color names
+    // (accent1, dark1, …) pass through unchanged.
+    private static string EnsureEightDigitHexForEffect(string color)
+    {
+        if (string.IsNullOrEmpty(color)) return color;
+        // Color may carry transforms ("000000+lumMod50"). Coerce only the
+        // base hex token (before the first '+'); scheme color names
+        // (accent1, dark1, …) pass through unchanged.
+        var plusIdx = color.IndexOf('+');
+        var head = plusIdx >= 0 ? color[..plusIdx] : color;
+        var tail = plusIdx >= 0 ? color[plusIdx..] : "";
+        var hadHash = head.StartsWith('#');
+        var hex = hadHash ? head[1..] : head;
+        if (hex.Length == 6 && hex.All(Uri.IsHexDigit))
+        {
+            // Schema readback contract: '#RRGGBBAA'. Ensure both '#' and the
+            // trailing 'FF' alpha byte are present.
+            return $"#{hex.ToUpperInvariant()}FF{tail}";
+        }
+        if (hex.Length == 8 && hex.All(Uri.IsHexDigit) && !hadHash)
+        {
+            // Already 8-digit but lacking '#' — add the leading hash.
+            return $"#{hex.ToUpperInvariant()}{tail}";
+        }
+        return color;
+    }
+
     private List<DocumentNode> GetSlideChildNodes(SlidePart slidePart, int slideNum, int depth)
     {
         var children = new List<DocumentNode>();
@@ -91,7 +123,7 @@ public partial class PowerPointHandler
             if (grpXfrm?.Extents?.Cx != null) grpNode.Format["width"] = FormatEmu(grpXfrm.Extents.Cx.Value);
             if (grpXfrm?.Extents?.Cy != null) grpNode.Format["height"] = FormatEmu(grpXfrm.Extents.Cy.Value);
             if (grpXfrm?.Rotation != null && grpXfrm.Rotation.Value != 0)
-                grpNode.Format["rotation"] = $"{grpXfrm.Rotation.Value / 60000.0:0.##}";
+                grpNode.Format["rotation"] = $"{grpXfrm.Rotation.Value / 60000.0:0.######}";
             var grpFillColor = ReadColorFromFill(grp.GroupShapeProperties?.GetFirstChild<Drawing.SolidFill>());
             if (grpFillColor != null) grpNode.Format["fill"] = grpFillColor;
             else if (grp.GroupShapeProperties?.GetFirstChild<Drawing.NoFill>() != null) grpNode.Format["fill"] = "none";
@@ -214,6 +246,17 @@ public partial class PowerPointHandler
             if (extents.Cy is not null) node.Format["height"] = FormatEmu(extents.Cy!);
         }
 
+        // CONSISTENCY(zorder): mirror shape/picture/connector — emit when
+        // parented to a ShapeTree so dump/replay preserves stacking order.
+        if (gf.Parent is ShapeTree tblZTree)
+        {
+            var tblZContent = tblZTree.ChildElements
+                .Where(e => e is Shape or Picture or GraphicFrame or GroupShape or ConnectionShape)
+                .ToList();
+            var tblZIdx = tblZContent.IndexOf(gf);
+            if (tblZIdx >= 0) node.Format["zorder"] = tblZIdx + 1;
+        }
+
         if (depth > 0)
         {
             int rIdx = 0;
@@ -294,6 +337,33 @@ public partial class PowerPointHandler
                             cellNode.Format["hmerge"] = true;
                         if (cell.VerticalMerge?.HasValue == true && cell.VerticalMerge.Value)
                             cellNode.Format["vmerge"] = true;
+
+                        // Cell text direction (a:tcPr @vert). Canonical readback
+                        // mirrors the Set vocabulary (horizontal / vertical270 /
+                        // vertical90 / stacked) so round-trip equality holds.
+                        if (tcPr?.Vertical?.HasValue == true)
+                        {
+                            cellNode.Format["textdirection"] = tcPr.Vertical.InnerText switch
+                            {
+                                "horz" => "horizontal",
+                                "vert" => "vertical90",
+                                "vert270" => "vertical270",
+                                "wordArtVert" => "stacked",
+                                "eaVert" => "eaVert",
+                                "mongolianVert" => "mongolianVert",
+                                "wordArtVertRtl" => "wordArtVertRtl",
+                                _ => tcPr.Vertical.InnerText
+                            };
+                        }
+
+                        // Cell text wrap (a:tcPr/a:txBody/a:bodyPr @wrap).
+                        // Set writes square|none on the cell's BodyProperties;
+                        // mirror back as bool (false == "none", true == "square").
+                        var cellBodyPr = cell.TextBody?.GetFirstChild<Drawing.BodyProperties>();
+                        if (cellBodyPr?.Wrap?.HasValue == true)
+                        {
+                            cellNode.Format["wrap"] = cellBodyPr.Wrap.Value != Drawing.TextWrappingValues.None;
+                        }
 
                         // Cell vertical alignment
                         if (tcPr?.Anchor?.HasValue == true)
@@ -888,21 +958,26 @@ public partial class PowerPointHandler
             var outerShadow = activeEffectList.GetFirstChild<Drawing.OuterShadow>();
             if (outerShadow != null)
             {
-                var shadowColor = ReadColorFromElement(outerShadow) ?? "000000";
+                var shadowColor = EnsureEightDigitHexForEffect(ReadColorFromElement(outerShadow) ?? "000000");
                 var blurPt = outerShadow.BlurRadius?.HasValue == true ? $"{outerShadow.BlurRadius.Value / 12700.0:0.##}" : "4";
                 var angleDeg = outerShadow.Direction?.HasValue == true ? $"{outerShadow.Direction.Value / 60000.0:0.##}" : "45";
                 var distPt = outerShadow.Distance?.HasValue == true ? $"{outerShadow.Distance.Value / 12700.0:0.##}" : "3";
                 var alphaEl = outerShadow.Descendants<Drawing.Alpha>().FirstOrDefault();
-                var opacity = alphaEl?.Val?.HasValue == true ? $"{alphaEl.Val.Value / 1000.0:0.##}" : "40";
+                // OOXML default: <a:outerShdw> without <a:alpha> is fully opaque
+                // (the shadow inherits the color element's alpha; an absent alpha
+                // means 100%). Defaulting to "40" used to mask explicit
+                // alpha=FF inputs as a 40% shadow on round-trip.
+                var opacity = alphaEl?.Val?.HasValue == true ? $"{alphaEl.Val.Value / 1000.0:0.##}" : "100";
                 node.Format["shadow"] = $"{shadowColor}-{blurPt}-{angleDeg}-{distPt}-{opacity}";
             }
             var glow = activeEffectList.GetFirstChild<Drawing.Glow>();
             if (glow != null)
             {
-                var glowColor = ReadColorFromElement(glow) ?? "000000";
+                var glowColor = EnsureEightDigitHexForEffect(ReadColorFromElement(glow) ?? "000000");
                 var radiusPt = glow.Radius?.HasValue == true ? $"{glow.Radius.Value / 12700.0:0.##}" : "8";
                 var glowAlpha = glow.Descendants<Drawing.Alpha>().FirstOrDefault();
-                var glowOpacity = glowAlpha?.Val?.HasValue == true ? $"{glowAlpha.Val.Value / 1000.0:0.##}" : "75";
+                // OOXML default: <a:glow> without <a:alpha> is fully opaque.
+                var glowOpacity = glowAlpha?.Val?.HasValue == true ? $"{glowAlpha.Val.Value / 1000.0:0.##}" : "100";
                 node.Format["glow"] = $"{glowColor}-{radiusPt}-{glowOpacity}";
             }
             var reflEl = activeEffectList.GetFirstChild<Drawing.Reflection>();
@@ -916,7 +991,12 @@ public partial class PowerPointHandler
             }
             var softEdge = activeEffectList.GetFirstChild<Drawing.SoftEdge>();
             if (softEdge?.Radius?.HasValue == true)
-                node.Format["softEdge"] = $"{softEdge.Radius.Value / 12700.0:0.##}";
+                // Unit-qualified pt — matches the cross-format canonical from
+                // root CLAUDE.md (line.width "0.75pt", padding "12pt", glow
+                // "4pt"). The bare numeric form here was the lone outlier on
+                // the effects readback surface and broke dump round-trip
+                // when set softEdge=<value> re-parses the readback.
+                node.Format["softEdge"] = $"{softEdge.Radius.Value / 12700.0:0.##}pt";
         }
 
         // 3D rotation (scene3d)
@@ -967,7 +1047,7 @@ public partial class PowerPointHandler
 
         // Rotation (plain number in degrees, no suffix, so Set can consume the value directly)
         if (xfrm?.Rotation != null && xfrm.Rotation.Value != 0)
-            node.Format["rotation"] = $"{xfrm.Rotation.Value / 60000.0:0.##}";
+            node.Format["rotation"] = $"{xfrm.Rotation.Value / 60000.0:0.######}";
 
         // Text margin
         var bodyPr = shape.TextBody?.Elements<Drawing.BodyProperties>().FirstOrDefault();
@@ -1025,7 +1105,12 @@ public partial class PowerPointHandler
             else node.Format["autoFit"] = "none";
         }
 
-        // Text alignment (from first paragraph)
+        // Text alignment (from first paragraph). Only surface when explicitly
+        // present in the source XML; the previous else-branch hard-coded
+        // align=left whenever pPr/algn was absent, which baked an explicit
+        // value into every round-trip and broke inheritance from the layout/
+        // master defRPr cascade. Callers that need the effective alignment
+        // can read Format["effective.align"] (cascade-resolved separately).
         var firstPara = shape.TextBody?.Elements<Drawing.Paragraph>().FirstOrDefault();
         if (firstPara?.ParagraphProperties?.Alignment?.HasValue == true)
         {
@@ -1038,10 +1123,6 @@ public partial class PowerPointHandler
                 "just" => "justify",
                 _ => alInner
             };
-        }
-        else if (shape.TextBody != null)
-        {
-            node.Format["align"] = "left";
         }
 
         // Paragraph spacing and indent (from first paragraph)
@@ -1355,7 +1436,18 @@ public partial class PowerPointHandler
             if (picXfrm.Extents.Cy is not null) node.Format["height"] = FormatEmu(picXfrm.Extents.Cy!);
         }
         if (picXfrm?.Rotation != null && picXfrm.Rotation.Value != 0)
-            node.Format["rotation"] = $"{picXfrm.Rotation.Value / 60000.0:0.##}";
+            node.Format["rotation"] = $"{picXfrm.Rotation.Value / 60000.0:0.######}";
+
+        // CONSISTENCY(zorder): mirror shape/connector — emit for any
+        // ShapeTree-rooted picture so Add(picture, zorder=N) round-trips.
+        if (pic.Parent is ShapeTree picZTree)
+        {
+            var picZContent = picZTree.ChildElements
+                .Where(e => e is Shape or Picture or GraphicFrame or GroupShape or ConnectionShape)
+                .ToList();
+            var picZIdx = picZContent.IndexOf(pic);
+            if (picZIdx >= 0) node.Format["zorder"] = picZIdx + 1;
+        }
 
         // Opacity (via AlphaModulateFixedEffect on blip)
         var picBlip = pic.BlipFill?.GetFirstChild<Drawing.Blip>();
@@ -1411,7 +1503,7 @@ public partial class PowerPointHandler
             var picOuterShadow = picEffectList.GetFirstChild<Drawing.OuterShadow>();
             if (picOuterShadow != null)
             {
-                var shadowColor = ReadColorFromElement(picOuterShadow) ?? "000000";
+                var shadowColor = EnsureEightDigitHexForEffect(ReadColorFromElement(picOuterShadow) ?? "000000");
                 var blurPt = picOuterShadow.BlurRadius?.HasValue == true ? $"{picOuterShadow.BlurRadius.Value / 12700.0:0.##}" : "4";
                 var angleDeg = picOuterShadow.Direction?.HasValue == true ? $"{picOuterShadow.Direction.Value / 60000.0:0.##}" : "45";
                 var distPt = picOuterShadow.Distance?.HasValue == true ? $"{picOuterShadow.Distance.Value / 12700.0:0.##}" : "3";
@@ -1422,7 +1514,7 @@ public partial class PowerPointHandler
             var picGlow = picEffectList.GetFirstChild<Drawing.Glow>();
             if (picGlow != null)
             {
-                var glowColor = ReadColorFromElement(picGlow) ?? "000000";
+                var glowColor = EnsureEightDigitHexForEffect(ReadColorFromElement(picGlow) ?? "000000");
                 var radiusPt = picGlow.Radius?.HasValue == true ? $"{picGlow.Radius.Value / 12700.0:0.##}" : "8";
                 var glowAlpha = picGlow.Descendants<Drawing.Alpha>().FirstOrDefault();
                 var glowOpacity = glowAlpha?.Val?.HasValue == true ? $"{glowAlpha.Val.Value / 1000.0:0.##}" : "75";
@@ -1526,7 +1618,7 @@ public partial class PowerPointHandler
         );
         // CONSISTENCY(escape-sequences): \n splits into paragraphs, \t becomes
         // <a:tab/> elements as paragraph children between text runs.
-        var lines = text.Replace("\\n", "\n").Replace("\\t", "\t").Split('\n');
+        var lines = OfficeCli.Core.TextEscape.Resolve(text).Split('\n');
         foreach (var line in lines)
         {
             var para = new Drawing.Paragraph();
@@ -1602,9 +1694,11 @@ public partial class PowerPointHandler
         }
         var solidFill = ln?.GetFirstChild<Drawing.SolidFill>();
         var rgb = solidFill?.GetFirstChild<Drawing.RgbColorModelHex>();
-        if (rgb?.Val?.HasValue == true)
-            // CONSISTENCY(canonical-key): canonical 'color'; 'lineColor' was legacy key.
-            node.Format["color"] = ParseHelpers.FormatHexColor(rgb.Val.Value!);
+        // CONSISTENCY(canonical-key): canonical 'color'; 'lineColor' was legacy.
+        // Use ReadColorFromFill so scheme-color line= (accent1, dark1, …) round-trips
+        // through Get; the prior rgb-only branch silently dropped a:schemeClr.
+        var cxnColor = ReadColorFromFill(solidFill);
+        if (cxnColor != null) node.Format["color"] = cxnColor;
 
         // Line opacity
         var cxnColorEl = rgb as OpenXmlElement ?? solidFill?.GetFirstChild<Drawing.SchemeColor>();
@@ -1621,7 +1715,20 @@ public partial class PowerPointHandler
 
         // Rotation
         if (xfrm?.Rotation?.HasValue == true && xfrm.Rotation.Value != 0)
-            node.Format["rotation"] = $"{xfrm.Rotation.Value / 60000.0:0.##}";
+            node.Format["rotation"] = $"{xfrm.Rotation.Value / 60000.0:0.######}";
+
+        // Z-order (1-based position among content elements: 1 = back, N = front).
+        // CONSISTENCY(zorder): shape/picture/group all emit zorder when parent is a
+        // ShapeTree; connector belongs to the same set and was previously omitted —
+        // round-trip of Add(connector, zorder=N) silently dropped the value.
+        if (cxn.Parent is ShapeTree cxnTree)
+        {
+            var contentEls = cxnTree.ChildElements
+                .Where(e => e is Shape or Picture or GraphicFrame or GroupShape or ConnectionShape)
+                .ToList();
+            var cxnZIdx = contentEls.IndexOf(cxn);
+            if (cxnZIdx >= 0) node.Format["zorder"] = cxnZIdx + 1;
+        }
 
         // Connection info (startShape/endShape)
         var cxnDrawProps = cxn.NonVisualConnectionShapeProperties?.NonVisualConnectorShapeDrawingProperties;

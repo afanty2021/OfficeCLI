@@ -354,6 +354,16 @@ public partial class PowerPointHandler
                 }
 
                 InsertAtPosition(imgShapeTree, picture, index);
+
+                // CONSISTENCY(zorder-on-add): dump-emit carries zorder=N; without
+                // consuming it here every picture appended at the end of the tree.
+                if (properties.TryGetValue("zorder", out var picZ)
+                    || properties.TryGetValue("z-order", out picZ)
+                    || properties.TryGetValue("order", out picZ))
+                {
+                    ApplyZOrder(imgSlidePart, picture, picZ);
+                }
+
                 GetSlide(imgSlidePart).Save();
 
                 return $"/slide[{imgSlideIdx}]/{BuildElementPathSegment("picture", picture, imgShapeTree.Elements<Picture>().Count())}";
@@ -451,6 +461,10 @@ public partial class PowerPointHandler
                     var chartGfEx = BuildExtendedChartGraphicFrame(chartSlidePart, extChartPart,
                         chartId, chartName, chartX, chartY, chartCx, chartCy);
                     InsertAtPosition(chartShapeTree, chartGfEx, index);
+                    if (properties.TryGetValue("zorder", out var cxZ)
+                        || properties.TryGetValue("z-order", out cxZ)
+                        || properties.TryGetValue("order", out cxZ))
+                        ApplyZOrder(chartSlidePart, chartGfEx, cxZ);
                     GetSlide(chartSlidePart).Save();
 
                     // Count all charts (both regular and extended)
@@ -475,6 +489,10 @@ public partial class PowerPointHandler
                 var chartGf = BuildChartGraphicFrame(chartSlidePart, chartPart, chartId, chartName,
                     chartX, chartY, chartCx, chartCy);
                 InsertAtPosition(chartShapeTree, chartGf, index);
+                if (properties.TryGetValue("zorder", out var stdZ)
+                    || properties.TryGetValue("z-order", out stdZ)
+                    || properties.TryGetValue("order", out stdZ))
+                    ApplyZOrder(chartSlidePart, chartGf, stdZ);
                 GetSlide(chartSlidePart).Save();
 
                 var chartCount = chartShapeTree.Elements<GraphicFrame>()
@@ -715,11 +733,17 @@ public partial class PowerPointHandler
         // 3. Icon image part (placeholder PNG or user-supplied).
         var (_, oleIconRelId) = OfficeCli.Core.OleHelper.CreateIconPart(oleSlidePart, properties);
 
-        // 4. Dimensions.
+        // 4. Dimensions. width/height must be >= 1 EMU — zero / negative would
+        // produce a <a:ext cx="0"/> which Office silently rejects on open and
+        // throws the whole shape away (matches shape size validation).
         long oleCx = properties.TryGetValue("width", out var wv)
             ? ParseEmu(wv) : OfficeCli.Core.OleHelper.DefaultOleWidthEmu;
         long oleCy = properties.TryGetValue("height", out var hv)
             ? ParseEmu(hv) : OfficeCli.Core.OleHelper.DefaultOleHeightEmu;
+        if (oleCx < 1)
+            throw new ArgumentException($"Invalid ole width '{properties.GetValueOrDefault("width")}': must be >= 1 EMU.");
+        if (oleCy < 1)
+            throw new ArgumentException($"Invalid ole height '{properties.GetValueOrDefault("height")}': must be >= 1 EMU.");
         long oleX = properties.TryGetValue("x", out var xv) ? ParseEmu(xv) : 457200;
         long oleY = properties.TryGetValue("y", out var yv) ? ParseEmu(yv) : 457200;
 

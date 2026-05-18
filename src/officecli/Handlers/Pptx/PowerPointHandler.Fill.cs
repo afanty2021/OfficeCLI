@@ -47,11 +47,61 @@ public partial class PowerPointHandler
     {
         if (solidFill == null) return null;
         var rgbEl = solidFill.GetFirstChild<Drawing.RgbColorModelHex>();
-        if (rgbEl?.Val?.Value != null) return FormatHexWithAlpha(rgbEl);
-        var scheme = solidFill.GetFirstChild<Drawing.SchemeColor>()?.Val;
-        if (scheme?.HasValue == true)
-            return ParseHelpers.NormalizeSchemeColorName(scheme.InnerText) ?? scheme.InnerText;
+        if (rgbEl?.Val?.Value != null) return AppendColorTransforms(FormatHexWithAlpha(rgbEl), rgbEl);
+        var schemeEl = solidFill.GetFirstChild<Drawing.SchemeColor>();
+        if (schemeEl != null)
+        {
+            // CONSISTENCY(scheme-color-unknown): when the SDK's EnumValue can't
+            // parse the schemeClr@val (custom themes with dk3/lt3/accent7+,
+            // future OOXML additions) .Val.HasValue is false and InnerText is
+            // empty. Fall back to the raw XML attribute so the color survives
+            // round-trip instead of silently disappearing.
+            var schemeVal = schemeEl.Val;
+            string? raw = (schemeVal?.HasValue == true && !string.IsNullOrEmpty(schemeVal.InnerText))
+                ? schemeVal.InnerText
+                : schemeEl.GetAttribute("val", "").Value;
+            if (!string.IsNullOrEmpty(raw))
+            {
+                var name = ParseHelpers.NormalizeSchemeColorName(raw) ?? raw;
+                return AppendColorTransforms(name, schemeEl);
+            }
+        }
         return null;
+    }
+
+    // R8-4: encode a:lumMod / a:lumOff / a:shade / a:tint / a:satMod / a:satOff /
+    // a:hueMod / a:hueOff color transforms as a chained "+name<intPercent>"
+    // suffix on the canonical color string so they survive Get → Add/Set
+    // round-trip. Pre-R8 these children were silently stripped: a slide's
+    // accent1 with lumMod=50000 came back as bare "accent1", and a re-applied
+    // round-trip lost the tint.
+    private static readonly string[] ColorTransformLocalNames =
+        { "lumMod", "lumOff", "shade", "tint", "satMod", "satOff", "hueMod", "hueOff", "alpha" };
+
+    internal static string AppendColorTransforms(string baseColor, OpenXmlElement colorEl)
+    {
+        // a:srgbClr encodes alpha into the trailing AA byte of FormatHexWithAlpha
+        // (RRGGBBAA), so the alpha child is already represented in the base hex.
+        // a:schemeClr has no hex form, so its alpha child has nowhere else to
+        // live and must be emitted as a "+alphaN" transform suffix to survive
+        // round-trip — without this, accent1@alpha50000 came back as bare
+        // "accent1" and re-applying the value lost the transparency.
+        bool isRgb = colorEl is Drawing.RgbColorModelHex;
+        var sb = new System.Text.StringBuilder(baseColor);
+        foreach (var child in colorEl.Elements())
+        {
+            var ln = child.LocalName;
+            if (Array.IndexOf(ColorTransformLocalNames, ln) < 0) continue;
+            if (ln == "alpha" && isRgb) continue; // alpha already encoded into RRGGBBAA hex form
+            var v = child.GetAttribute("val", "").Value;
+            if (string.IsNullOrEmpty(v)) continue;
+            // Convert OOXML ST_PositivePercentage (0..100000) → human percent.
+            if (int.TryParse(v, out var n))
+                sb.Append('+').Append(ln).Append(n / 1000);
+            else
+                sb.Append('+').Append(ln).Append(v);
+        }
+        return sb.ToString();
     }
 
     /// <summary>
@@ -61,9 +111,30 @@ public partial class PowerPointHandler
     {
         if (parent == null) return null;
         var rgbEl = parent.GetFirstChild<Drawing.RgbColorModelHex>();
-        if (rgbEl?.Val?.Value != null) return FormatHexWithAlpha(rgbEl);
-        var scheme = parent.GetFirstChild<Drawing.SchemeColor>()?.Val;
-        if (scheme?.HasValue == true) return scheme.InnerText;
+        if (rgbEl?.Val?.Value != null) return AppendColorTransforms(FormatHexWithAlpha(rgbEl), rgbEl);
+        var schemeEl = parent.GetFirstChild<Drawing.SchemeColor>();
+        // CONSISTENCY(scheme-color-roundtrip): emit canonical long names
+        // (dark1/light1/hyperlink/…) so OOXML internal short forms
+        // (dk1/lt1/hlink/…) round-trip through Get the same way
+        // ReadColorFromFill normalises them. Without this, shadow/glow/
+        // gradient-stop schemeClr readback surfaced raw InnerText
+        // ("dk1"/"hlink"/…), which Add/Set accepts but Get clients
+        // following the documented vocabulary wouldn't recognise.
+        if (schemeEl != null)
+        {
+            // CONSISTENCY(scheme-color-unknown): mirror ReadColorFromFill —
+            // fall back to the raw @val attribute when EnumValue can't parse it
+            // (custom themes, future OOXML additions).
+            var schemeVal = schemeEl.Val;
+            string? raw = (schemeVal?.HasValue == true && !string.IsNullOrEmpty(schemeVal.InnerText))
+                ? schemeVal.InnerText
+                : schemeEl.GetAttribute("val", "").Value;
+            if (!string.IsNullOrEmpty(raw))
+            {
+                var name = ParseHelpers.NormalizeSchemeColorName(raw) ?? raw;
+                return AppendColorTransforms(name, schemeEl);
+            }
+        }
         return null;
     }
 
@@ -102,7 +173,31 @@ public partial class PowerPointHandler
               || IsGradientColorString(normalized))
             newFill = BuildGradientFill(normalized);
         else
+        {
+            // CONSISTENCY(scheme-fill-transform-preserve): re-setting the same
+            // scheme color (with no user-supplied +lumMod/+shade suffix) on a
+            // shape that already carries lumMod/lumOff/shade/tint/satMod/hueMod
+            // transforms must NOT strip them — the user expects a no-op when
+            // they re-apply the same theme slot. R49 (756a9a13) only covered
+            // mutations of an UNRELATED shape; this handles the same-shape
+            // case. Skip when the new value carries its own transform chain
+            // ("accent1+lumMod=75000" or "accent1:lumMod=75000") — that's an
+            // explicit overwrite.
+            if (!value.Contains('+') && !value.Contains(':'))
+            {
+                var existingSolid = spPr.GetFirstChild<Drawing.SolidFill>();
+                var existingScheme = existingSolid?.GetFirstChild<Drawing.SchemeColor>();
+                var newScheme = TryParseSchemeColor(value);
+                if (existingScheme != null && newScheme.HasValue
+                    && existingScheme.Val?.Value == newScheme.Value
+                    && existingScheme.Elements().Any(c =>
+                        Array.IndexOf(ColorTransformLocalNames, c.LocalName) >= 0))
+                {
+                    return; // preserve transforms — no-op
+                }
+            }
             newFill = BuildSolidFill(value);
+        }
 
         spPr.RemoveAllChildren<Drawing.SolidFill>();
         spPr.RemoveAllChildren<Drawing.NoFill>();
@@ -464,11 +559,62 @@ public partial class PowerPointHandler
             "stripedrightarrow" => Drawing.ShapeTypeValues.StripedRightArrow,
             "uturnarrow" => Drawing.ShapeTypeValues.UTurnArrow,
             "circulararrow" => Drawing.ShapeTypeValues.CircularArrow,
-            _ => throw new ArgumentException(
-                $"Unknown preset shape: '{name}'. Common presets: rect, roundRect, ellipse, triangle, diamond, " +
-                "pentagon, hexagon, star5, rightArrow, leftArrow, chevron, plus, heart, cloud, cube, can, line, " +
-                "callout, process, decision, smiley, frame, gear6")
+            // ParsePresetShape can't enumerate all ~180 OOXML preset values by hand.
+            // Fall back to reflection lookup on Drawing.ShapeTypeValues static
+            // properties so dump-replay survives preset names absent from the
+            // hand-rolled list (pie, chord, blockArc, mathDivide, callouts, …).
+            // Last-resort degrade is Rectangle so a single missing preset never
+            // takes the whole shape add down (which would cascade positional refs).
+            _ => ResolveShapeTypeByReflection(name) ?? Drawing.ShapeTypeValues.Rectangle,
         };
+
+    private static Drawing.ShapeTypeValues? ResolveShapeTypeByReflection(string name)
+    {
+        var lower = name.ToLowerInvariant();
+        var props = typeof(Drawing.ShapeTypeValues).GetProperties(
+            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+        foreach (var p in props)
+        {
+            if (p.PropertyType != typeof(Drawing.ShapeTypeValues)) continue;
+            if (string.Equals(p.Name, lower, StringComparison.OrdinalIgnoreCase))
+                return (Drawing.ShapeTypeValues?)p.GetValue(null);
+        }
+        return null;
+    }
+
+    // Strict variant used by Set to surface unknown preset names as an
+    // unsupported_property error instead of silently degrading to Rectangle.
+    // ParsePresetShape's last-resort degrade exists so a single bad preset
+    // never takes a whole shape add (and its positional refs) down on import,
+    // but Set is a single-property mutation — silently rewriting the user's
+    // geometry to a rectangle is a worse outcome than telling them the name
+    // wasn't recognised.
+    internal static bool TryParsePresetShape(string name, out Drawing.ShapeTypeValues value)
+    {
+        try
+        {
+            var explicitHit = ParsePresetShape(name);
+            // ParsePresetShape returns Rectangle for unknown names — to
+            // distinguish a real "rect" input from the degraded fallback,
+            // also check the explicit alias list / reflection path.
+            var lower = name.ToLowerInvariant();
+            if (lower is "rect" or "rectangle") { value = explicitHit; return true; }
+            if (ResolveShapeTypeByReflection(name) != null) { value = explicitHit; return true; }
+            // Heuristic: if ParsePresetShape gave us anything other than the
+            // Rectangle fallback, it matched a hand-rolled alias. (Rectangle
+            // is the only fallback target, so any non-Rectangle return is a
+            // real hit; a Rectangle return without "rect"/"rectangle" input
+            // is the silent degrade we want to reject.)
+            if (explicitHit != Drawing.ShapeTypeValues.Rectangle) { value = explicitHit; return true; }
+            value = explicitHit;
+            return false;
+        }
+        catch
+        {
+            value = Drawing.ShapeTypeValues.Rectangle;
+            return false;
+        }
+    }
 
     // BUG-FIX(B8): canonical names mirror OOXML LineEndValues so that the
     // value passed to Add/Set round-trips through Get. The previous mapping

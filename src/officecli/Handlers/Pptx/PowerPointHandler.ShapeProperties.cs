@@ -80,25 +80,33 @@ public partial class PowerPointHandler
     private static readonly System.Collections.Generic.HashSet<string> DrawingCapsEnum =
         new(System.StringComparer.Ordinal) { "none", "small", "all" };
 
-    // BCP-47 shape per RFC 5646 §2.1 (subset): primary subtag 2-3 ALPHA (or
-    // 4-8 ALPHA for reserved/registered), then hyphen-separated subtags each
-    // 1-8 alphanumerics, total length <= 35. Also accepts `x-…` private-use.
-    // R18-fuzz-3: tightened — old shape `^[A-Za-z][A-Za-z0-9-]*$` accepted
-    // hyphen-less garbage like "INVALID" and 1000-char strings.
-    private const int Bcp47MaxLength = 35;
-    private static readonly System.Text.RegularExpressions.Regex Bcp47Shape =
-        new(@"^(?:[A-Za-z]{2,3}(?:-[A-Za-z0-9]{1,8})*|[A-Za-z]{4,8}(?:-[A-Za-z0-9]{1,8})+|x(?:-[A-Za-z0-9]{1,8})+)$",
-            System.Text.RegularExpressions.RegexOptions.Compiled);
+    // CONSISTENCY(bcp47-validation): shape regex lives in Core/Bcp47LanguageTag.cs
+    // so docx and pptx share one validator. `lang` and `altLang` are the only
+    // BCP-47-shaped attrs in rPr; the rest of the long-tail string attrs
+    // (kumimoji, bmk, …) stay free-form.
 
     private static bool IsValidDrawingRunAttrValue(string key, string value)
     {
-        if (DrawingRunIntAttrs.Contains(key)) return int.TryParse(value, out _);
+        if (DrawingRunIntAttrs.Contains(key))
+        {
+            if (!int.TryParse(value, out var iv)) return false;
+            // OOXML ST_TextNonNegativePoint refuses negative kern. Writing
+            // kern=-100 produces a file PowerPoint silently rewrites on open.
+            // Upper bound mirrors ST_TextPoint's 400000 hundredths-of-a-point
+            // ceiling — beyond that PowerPoint clamps on open, so reject up
+            // front instead of letting an out-of-band value land on disk.
+            if (key == "kern" && (iv < 0 || iv > 400000)) return false;
+            // OOXML ST_TextPoint clamps spc to [-400000, 400000] hundredths
+            // of a point. Out-of-band values get silently dropped on open.
+            if (key == "spc" && (iv < -400000 || iv > 400000)) return false;
+            return true;
+        }
         if (DrawingRunBoolAttrs.Contains(key))
             return value is "0" or "1" or "true" or "false" or "True" or "False";
         if (key == "u") return DrawingUnderlineEnum.Contains(value);
         if (key == "strike") return DrawingStrikeEnum.Contains(value);
         if (key == "cap") return DrawingCapsEnum.Contains(value);
-        if (key is "lang" or "altLang") return string.IsNullOrEmpty(value) || (value.Length <= Bcp47MaxLength && Bcp47Shape.IsMatch(value));
+        if (key is "lang" or "altLang") return OfficeCli.Core.Bcp47LanguageTag.IsValid(value);
         return true; // remaining string attrs (kumimoji handled above; bmk arbitrary string)
     }
 
@@ -163,6 +171,31 @@ public partial class PowerPointHandler
             }
         }
 
+        // Raise OOXML short-form attribute names to canonical curated case
+        // labels BEFORE dispatch. Without this, short-forms (`sz`, `b`, `i`,
+        // `u`, `strike`) fall through to the long-tail attribute writer which
+        // writes the raw value verbatim — `sz=14` lands as sz="14" violating
+        // ST_TextFontSize (min 100, hundredths of a point) and corrupts the
+        // file; `b=true` lands as b="true" instead of the xsd:boolean
+        // canonical "1". Mapping early lets the curated cases below handle
+        // unit conversion and canonical serialization (FontSize×100, bool→1/0).
+        var shortFormMap = new (string Short, string Canonical)[]
+        {
+            ("sz", "size"),
+            ("b", "bold"),
+            ("i", "italic"),
+            ("u", "underline"),
+        };
+        foreach (var (shortKey, canonical) in shortFormMap)
+        {
+            string? matched = properties.Keys.FirstOrDefault(k => k.Equals(shortKey, StringComparison.Ordinal));
+            if (matched == null || properties.ContainsKey(canonical)) continue;
+            var v = properties[matched];
+            properties = new Dictionary<string, string>(properties, properties.Comparer);
+            properties.Remove(matched);
+            properties[canonical] = v;
+        }
+
         // CONSISTENCY(prop-order): fill carriers (fill/gradient/pattern) must run
         // before modifier props (opacity attaches alpha to the resulting solidFill);
         // otherwise opacity auto-creates a white fill that fill= then overwrites.
@@ -202,9 +235,10 @@ public partial class PowerPointHandler
                 }
                 case "text":
                 {
+                    XmlTextValidator.ValidateOrThrow(value, "text");
                     // CONSISTENCY(escape-sequences): \n splits paragraphs, \t
                     // becomes <a:tab/> paragraph children between text runs.
-                    var resolved = value.Replace("\\n", "\n").Replace("\\t", "\t");
+                    var resolved = OfficeCli.Core.TextEscape.Resolve(value);
                     var textLines = resolved.Split('\n');
                     if (runs.Count == 1 && textLines.Length == 1 && !textLines[0].Contains('\t'))
                     {
@@ -566,16 +600,27 @@ public partial class PowerPointHandler
                     // Check if value is a preset shape name (no spaces, no commas, simple identifier)
                     if (!value.Contains(' ') && !value.Contains(',') && !value.Contains('M'))
                     {
-                        // Treat as preset shape name
+                        // Treat as preset shape name. Use the strict variant so
+                        // an unrecognised name surfaces as unsupported_property
+                        // instead of silently rewriting the geometry to a
+                        // rectangle (the Add-side fallback's intent — keep a
+                        // batch import alive on one bad preset — is wrong for a
+                        // single-property Set: the caller asked for a specific
+                        // shape and deserves to know the name didn't match).
+                        if (!TryParsePresetShape(value, out var preset))
+                        {
+                            unsupported.Add($"{key}={value} (unknown preset shape name)");
+                            break;
+                        }
                         spPr.RemoveAllChildren<Drawing.CustomGeometry>();
                         var existingGeom = spPr.GetFirstChild<Drawing.PresetGeometry>();
                         if (existingGeom != null)
-                            existingGeom.Preset = ParsePresetShape(value);
+                            existingGeom.Preset = preset;
                         else
                             {
                             var newGeom = EnsurePresetGeometry(spPr);
                             newGeom.AppendChild(new Drawing.AdjustValueList());
-                            newGeom.Preset = ParsePresetShape(value);
+                            newGeom.Preset = preset;
                         }
                     }
                     else
@@ -793,7 +838,18 @@ public partial class PowerPointHandler
                     if (spPr == null) { unsupported.Add(key); break; }
                     if (!double.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var opacityVal) || double.IsNaN(opacityVal) || double.IsInfinity(opacityVal))
                         throw new ArgumentException($"Invalid 'opacity' value: '{value}'. Expected a finite decimal 0.0-1.0 (e.g. 0.5 = 50% opacity).");
-                    if (opacityVal > 1.0) opacityVal /= 100.0; // treat >1 as percentage (e.g. 30 → 0.30)
+                    // The percentage shorthand (>1 treated as 0-100 percent)
+                    // was silently accepting ambiguous values in the (1, 2)
+                    // range: opacity=1.5 → divided to 0.015, written as
+                    // alpha=1500 (≈1.5% visible) instead of being rejected
+                    // outright. 1.5 isn't a meaningful percentage (a user
+                    // typing "1.5" almost certainly meant the decimal form,
+                    // which is out of range) AND isn't a meaningful decimal
+                    // (>1). Treat the gap as a clear input error rather than
+                    // a silent /100 division.
+                    if (opacityVal > 1.0 && opacityVal < 2.0)
+                        throw new ArgumentException($"Invalid 'opacity' value: '{value}'. Expected 0.0-1.0 as decimal or 2-100 as percent (use 0-1 for the decimal form; values in (1, 2) are ambiguous).");
+                    if (opacityVal > 1.0) opacityVal /= 100.0; // treat >=2 as percentage (e.g. 30 → 0.30)
                     // R10: reject out-of-range opacity instead of writing invalid OOXML
                     // (a:alpha/@val must be in [0, 100000]). Negative input was producing
                     // <a:alpha val="-100000"/> which corrupts the file.
@@ -857,6 +913,11 @@ public partial class PowerPointHandler
                     if (!double.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var spcDbl) || double.IsNaN(spcDbl) || double.IsInfinity(spcDbl))
                         throw new ArgumentException($"Invalid 'charspacing' value: '{value}'. Expected a finite number in points (e.g. 2, -1, 0.5).");
                     var spcVal = (int)(spcDbl * 100);
+                    // OOXML ST_TextPoint: hundredths of a point, range
+                    // [-400000, 400000] (== [-4000pt, 4000pt]). PowerPoint
+                    // silently rewrites out-of-band values to default on open.
+                    if (spcVal < -400000 || spcVal > 400000)
+                        throw new ArgumentException($"Invalid 'charspacing' value: '{value}': OOXML ST_TextPoint range is [-4000pt, 4000pt].");
                     foreach (var run in runs)
                     {
                         var rProps = run.RunProperties ?? (run.RunProperties = new Drawing.RunProperties());
@@ -908,14 +969,10 @@ public partial class PowerPointHandler
                         var lnSpcElem = lsIsPct
                             ? new Drawing.LineSpacing(new Drawing.SpacingPercent { Val = lsIntVal })
                             : new Drawing.LineSpacing(new Drawing.SpacingPoints { Val = lsIntVal });
-                        // CT_TextParagraphProperties schema: lnSpc → spcBef → spcAft
-                        var spcBef = pProps.GetFirstChild<Drawing.SpaceBefore>();
-                        var spcAft = pProps.GetFirstChild<Drawing.SpaceAfter>();
-                        var insertBefore = spcBef ?? (OpenXmlElement?)spcAft;
-                        if (insertBefore != null)
-                            pProps.InsertBefore(lnSpcElem, insertBefore);
-                        else
-                            pProps.AppendChild(lnSpcElem);
+                        // CONSISTENCY(schema-order-pptx): pPr children must follow
+                        // CT_TextParagraphProperties order or PowerPoint silently
+                        // drops them. See PowerPointHandler.Helpers.cs.
+                        InsertPPrChild(pProps, lnSpcElem);
                     }
                     break;
                 }
@@ -927,13 +984,7 @@ public partial class PowerPointHandler
                     {
                         var pProps = para.ParagraphProperties ?? (para.ParagraphProperties = new Drawing.ParagraphProperties());
                         pProps.RemoveAllChildren<Drawing.SpaceBefore>();
-                        var spcBefElem = new Drawing.SpaceBefore(new Drawing.SpacingPoints { Val = sbIntVal });
-                        // CT_TextParagraphProperties schema: lnSpc → spcBef → spcAft
-                        var spcAftRef = pProps.GetFirstChild<Drawing.SpaceAfter>();
-                        if (spcAftRef != null)
-                            pProps.InsertBefore(spcBefElem, spcAftRef);
-                        else
-                            pProps.AppendChild(spcBefElem);
+                        InsertPPrChild(pProps, new Drawing.SpaceBefore(new Drawing.SpacingPoints { Val = sbIntVal }));
                     }
                     break;
                 }
@@ -945,7 +996,7 @@ public partial class PowerPointHandler
                     {
                         var pProps = para.ParagraphProperties ?? (para.ParagraphProperties = new Drawing.ParagraphProperties());
                         pProps.RemoveAllChildren<Drawing.SpaceAfter>();
-                        pProps.AppendChild(new Drawing.SpaceAfter(new Drawing.SpacingPoints { Val = saIntVal }));
+                        InsertPPrChild(pProps, new Drawing.SpaceAfter(new Drawing.SpacingPoints { Val = saIntVal }));
                     }
                     break;
                 }
@@ -987,10 +1038,20 @@ public partial class PowerPointHandler
                     bodyPr.RemoveAllChildren<Drawing.NoAutoFit>();
                     switch (value.ToLowerInvariant())
                     {
-                        case "true" or "normal" or "normautofit" or "auto" or "shrink": bodyPr.AppendChild(new Drawing.NormalAutoFit()); break;
+                        case "true" or "normal" or "normautofit" or "auto": bodyPr.AppendChild(new Drawing.NormalAutoFit()); break;
                         case "shape" or "spautofit" or "resize": bodyPr.AppendChild(new Drawing.ShapeAutoFit()); break;
                         case "false" or "none": bodyPr.AppendChild(new Drawing.NoAutoFit()); break;
-                        default: throw new ArgumentException($"Invalid autofit value: '{value}'. Valid values: true/normal/shrink, shape/resize, false/none.");
+                        // 'shrink' previously aliased to 'normal' (same plain
+                        // <a:normAutofit/> with no fontScale/lnSpcReduction
+                        // attributes), so callers asking for shrink-on-overflow
+                        // got identical XML to autofit=normal. Reject the alias
+                        // instead of silently lying — implementing real shrink
+                        // requires picking fontScale/lnSpcReduction values per
+                        // overflow geometry, which is its own feature. Callers
+                        // wanting shrink-on-overflow today should use
+                        // autofit=normal and tune fontScale via raw-set.
+                        case "shrink": throw new ArgumentException($"Invalid autofit value: 'shrink'. PowerPoint's shrink-on-overflow requires fontScale/lnSpcReduction attributes that officecli does not synthesize; use autofit=normal (plain normAutofit) and tune via raw-set if needed. Valid values: true/normal, shape/resize, false/none.");
+                        default: throw new ArgumentException($"Invalid autofit value: '{value}'. Valid values: true/normal, shape/resize, false/none.");
                     }
                     break;
                 }
@@ -1155,7 +1216,11 @@ public partial class PowerPointHandler
                 case "name":
                 {
                     var nvPr = shape.NonVisualShapeProperties?.NonVisualDrawingProperties;
-                    if (nvPr != null) nvPr.Name = value;
+                    if (nvPr != null)
+                    {
+                        XmlTextValidator.ValidateOrThrow(value, "name");
+                        nvPr.Name = value;
+                    }
                     else unsupported.Add(key);
                     break;
                 }
@@ -1163,7 +1228,11 @@ public partial class PowerPointHandler
                 case "alt" or "alttext" or "description":
                 {
                     var nvPr = shape.NonVisualShapeProperties?.NonVisualDrawingProperties;
-                    if (nvPr != null) nvPr.Description = value;
+                    if (nvPr != null)
+                    {
+                        XmlTextValidator.ValidateOrThrow(value, "alttext");
+                        nvPr.Description = value;
+                    }
                     else unsupported.Add(key);
                     break;
                 }
@@ -1258,6 +1327,18 @@ public partial class PowerPointHandler
                             // (handler-doesn't-implement). Invalid values silently
                             // accepted would corrupt the document and fail strict
                             // OOXML validation downstream.
+                            // CONSISTENCY(bcp47-error): mirror the docx lang error
+                            // shape so agents see one message across handlers
+                            // (WordHandler.Helpers.cs ~1671).
+                            if (key is "lang" or "altLang")
+                                throw new ArgumentException(
+                                    $"Invalid BCP-47 language tag for {key}: '{value}'. Expected a tag like 'en-US', 'ja-JP', or 'ar-SA' (RFC 5646: <= {OfficeCli.Core.Bcp47LanguageTag.MaxLength} chars, primary subtag 2-3 letters, then hyphen-separated subtags).");
+                            if (key == "kern" && int.TryParse(value, out var kv) && kv < 0)
+                                throw new ArgumentException(
+                                    $"Invalid kern '{value}': OOXML ST_TextNonNegativePoint requires kern >= 0 (hundredths of a point).");
+                            if (key == "spc" && int.TryParse(value, out var sv) && (sv < -400000 || sv > 400000))
+                                throw new ArgumentException(
+                                    $"Invalid spc '{value}': OOXML ST_TextPoint range is [-400000, 400000] hundredths of a point.");
                             throw new ArgumentException(
                                 $"Invalid value for OOXML rPr/{key}: '{value}'.");
                         }
@@ -1391,10 +1472,11 @@ public partial class PowerPointHandler
             {
                 case "text":
                 {
+                    XmlTextValidator.ValidateOrThrow(value, "text");
                     var textBody = cell.TextBody;
                     // CONSISTENCY(escape-sequences): \n -> paragraph split,
                     // \t -> <a:tab/> between runs.
-                    var lines = value.Replace("\\n", "\n").Replace("\\t", "\t").Split('\n');
+                    var lines = OfficeCli.Core.TextEscape.Resolve(value).Split('\n');
                     if (textBody == null)
                     {
                         textBody = new Drawing.TextBody(
@@ -1413,10 +1495,23 @@ public partial class PowerPointHandler
                     {
                         var firstRun = textBody.Descendants<Drawing.Run>().FirstOrDefault();
                         var runProps = firstRun?.RunProperties?.CloneNode(true) as Drawing.RunProperties;
+                        // Snapshot the existing first paragraph's properties
+                        // (algn, lvl, marL, indent, …) so a single set call
+                        // that bundles `align=center` with `text='X'` doesn't
+                        // lose the alignment when text rebuilds the
+                        // paragraph tree. Iteration order on a Dictionary is
+                        // insertion order on .NET but callers shouldn't have
+                        // to know that — preserve align by cloning the
+                        // existing pPr BEFORE wiping paragraphs, then
+                        // re-attach on each rebuilt paragraph.
+                        var firstPara = textBody.GetFirstChild<Drawing.Paragraph>();
+                        var savedPPr = firstPara?.ParagraphProperties?.CloneNode(true) as Drawing.ParagraphProperties;
                         textBody.RemoveAllChildren<Drawing.Paragraph>();
                         foreach (var line in lines)
                         {
                             var para = new Drawing.Paragraph();
+                            if (savedPPr != null)
+                                para.ParagraphProperties = savedPPr.CloneNode(true) as Drawing.ParagraphProperties;
                             AppendLineWithTabs(para, line, seg =>
                             {
                                 var r = new Drawing.Run();
@@ -1521,6 +1616,7 @@ public partial class PowerPointHandler
                 }
                 case "fill":
                 case "background":
+                case "gradient":
                 {
                     // CONSISTENCY(fill-gradient-shorthand): accept linear
                     // ("C1-C2[-angle]"), radial ("radial:C1-C2[-focus]"),
@@ -1529,6 +1625,9 @@ public partial class PowerPointHandler
                     // slide-background contract via the shared
                     // NormalizeGradientValue / IsGradientColorString /
                     // BuildGradientFill helpers in Fill.cs.
+                    // `gradient=` is the canonical key shape-level uses
+                    // (shape Set dispatches to ApplyGradientFill); mirror
+                    // it on cells so dump/replay and direct callers work.
                     // Build new fill element BEFORE removing old one (atomic: no data loss on invalid color)
                     var normalizedCellFill = NormalizeGradientValue(value);
                     OpenXmlElement newCellFill;
@@ -1817,7 +1916,50 @@ public partial class PowerPointHandler
                     string? borderColor = null;
                     long? borderWidth = null;
                     string? borderDash = null;
-                    if (!isNone)
+                    // Sub-key axis selectors: border.width / border.color /
+                    // border.dash (and the edge-qualified .left.width etc).
+                    // Without this routing, "border.width=-5" fell through to
+                    // the loose space-branch and set borderColor="-5" — a
+                    // silent corruption. Detect the sub-key suffix and route
+                    // the value to the matching axis, then reject negatives
+                    // for width to match OOXML ST_LineWidth's non-negative
+                    // requirement (mirrors line.width's ParseEmuAsInt guard).
+                    bool isWidthOnly = k.EndsWith(".width", StringComparison.Ordinal);
+                    bool isColorOnly = k.EndsWith(".color", StringComparison.Ordinal);
+                    bool isDashOnly = k.EndsWith(".dash", StringComparison.Ordinal);
+                    if (!isNone && (isWidthOnly || isColorOnly || isDashOnly))
+                    {
+                        if (isWidthOnly)
+                        {
+                            // ParseLineWidth treats bare numbers as pt,
+                            // routes through ParseEmuAsInt which rejects
+                            // negatives and INT32 overflow. Catch the
+                            // rejection and re-raise with a border-shaped
+                            // message so the caller sees the key, not a
+                            // generic "dimension" diagnostic.
+                            try
+                            {
+                                borderWidth = Core.EmuConverter.ParseLineWidth(value);
+                            }
+                            catch (ArgumentException)
+                            {
+                                throw new ArgumentException($"Invalid border width: '{value}' (must be >= 0).");
+                            }
+                        }
+                        else if (isColorOnly)
+                        {
+                            borderColor = value.TrimStart('#').ToUpperInvariant();
+                        }
+                        else
+                        {
+                            var d = value.ToLowerInvariant();
+                            if (d is "solid" or "dot" or "dash" or "lgdash" or "dashdot" or "sysdot" or "sysdash")
+                                borderDash = d;
+                            else
+                                throw new ArgumentException($"Invalid border dash value: '{value}'. Valid values: solid, dot, dash, lgDash, dashDot, sysDot, sysDash.");
+                        }
+                    }
+                    else if (!isNone)
                     {
                         if (value.Contains(';'))
                         {
@@ -1831,6 +1973,16 @@ public partial class PowerPointHandler
                                 if (!wStr.EndsWith("pt", StringComparison.OrdinalIgnoreCase))
                                     wStr += "pt";
                                 borderWidth = Core.EmuConverter.ParseEmu(wStr);
+                                // OOXML ST_LineWidth requires >= 0. ParseEmu
+                                // returns a signed long with no sign guard;
+                                // reject negatives here so border.width=-5 no
+                                // longer silently writes a negative w
+                                // attribute that downstream readers truncate.
+                                // Mirrors line.width's ParseLineWidth path
+                                // (ParseEmuAsInt rejects negatives) and the
+                                // padding/margin guards below.
+                                if (borderWidth.Value < 0)
+                                    throw new ArgumentException($"Invalid border width: '{scParts[1]}' (must be >= 0).");
                             }
                             // Part 2: color
                             if (scParts.Length > 2 && !string.IsNullOrEmpty(scParts[2]))
@@ -1854,7 +2006,11 @@ public partial class PowerPointHandler
                                 if (bp.EndsWith("pt", StringComparison.OrdinalIgnoreCase) ||
                                     bp.EndsWith("cm", StringComparison.OrdinalIgnoreCase) ||
                                     bp.EndsWith("px", StringComparison.OrdinalIgnoreCase))
+                                {
                                     borderWidth = Core.EmuConverter.ParseEmu(bp);
+                                    if (borderWidth.Value < 0)
+                                        throw new ArgumentException($"Invalid border width: '{bp}' (must be >= 0).");
+                                }
                                 else if (bp.ToLowerInvariant() is "solid" or "dot" or "dash" or "lgdash" or "dashdot" or "sysdot" or "sysdash")
                                     borderDash = bp.ToLowerInvariant();
                                 else if (bp.Length >= 3 && !bp.Equals("none", StringComparison.OrdinalIgnoreCase))
@@ -2060,11 +2216,8 @@ public partial class PowerPointHandler
                         var ls = new Drawing.LineSpacing();
                         if (isPct) ls.AppendChild(new Drawing.SpacingPercent { Val = spcVal });
                         else ls.AppendChild(new Drawing.SpacingPoints { Val = spcVal });
-                        // CT_TextParagraphProperties schema: lnSpc → spcBef → spcAft
-                        var insertBefore = (OpenXmlElement?)pProps.GetFirstChild<Drawing.SpaceBefore>()
-                            ?? pProps.GetFirstChild<Drawing.SpaceAfter>();
-                        if (insertBefore != null) pProps.InsertBefore(ls, insertBefore);
-                        else pProps.AppendChild(ls);
+                        // CONSISTENCY(schema-order-pptx): see Helpers.InsertPPrChild.
+                        InsertPPrChild(pProps, ls);
                     }
                     break;
                 }
@@ -2077,10 +2230,7 @@ public partial class PowerPointHandler
                         pProps.RemoveAllChildren<Drawing.SpaceBefore>();
                         var sb = new Drawing.SpaceBefore();
                         sb.AppendChild(new Drawing.SpacingPoints { Val = sbVal });
-                        // CT_TextParagraphProperties schema: lnSpc → spcBef → spcAft
-                        var spcAftRef = pProps.GetFirstChild<Drawing.SpaceAfter>();
-                        if (spcAftRef != null) pProps.InsertBefore(sb, spcAftRef);
-                        else pProps.AppendChild(sb);
+                        InsertPPrChild(pProps, sb);
                     }
                     break;
                 }
@@ -2093,7 +2243,7 @@ public partial class PowerPointHandler
                         pProps.RemoveAllChildren<Drawing.SpaceAfter>();
                         var sa = new Drawing.SpaceAfter();
                         sa.AppendChild(new Drawing.SpacingPoints { Val = saVal });
-                        pProps.AppendChild(sa); // spcAft is last, append is correct
+                        InsertPPrChild(pProps, sa);
                     }
                     break;
                 }
@@ -2104,7 +2254,15 @@ public partial class PowerPointHandler
                     if (tcPrO != null)
                     {
                         var opacityVal = ParseHelpers.SafeParseDouble(value, "opacity");
-                        if (opacityVal > 1.0) opacityVal /= 100.0; // treat >1 as percentage (e.g. 50 → 0.50)
+                        // CONSISTENCY(opacity-clamp): values in (1, 2) are
+                        // ambiguous — explicit-reject upfront before the /100
+                        // would silently coerce 1.5 to 0.015. See the shape
+                        // opacity path for the full rationale.
+                        if (opacityVal > 1.0 && opacityVal < 2.0)
+                            throw new ArgumentException($"Invalid 'opacity' value: '{value}'. Expected 0.0-1.0 as decimal or 2-100 as percent (values in (1, 2) are ambiguous).");
+                        if (opacityVal > 1.0) opacityVal /= 100.0; // treat >=2 as percentage (e.g. 50 → 0.50)
+                        if (opacityVal < 0.0 || opacityVal > 1.0)
+                            throw new ArgumentException($"Invalid 'opacity' value: '{value}'. Expected 0.0-1.0 (or 0-100 as percent).");
                         var alphaVal = (int)Math.Round(opacityVal * 100000); // 0.0-1.0 → 0-100000
                         alphaVal = Math.Max(0, Math.Min(100000, alphaVal));
                         var solidFill = tcPrO.GetFirstChild<Drawing.SolidFill>();
@@ -2279,6 +2437,16 @@ public partial class PowerPointHandler
             if (bp.RightInset != null) rightEmu = bp.RightInset.Value;
             if (bp.TopInset != null) topEmu = bp.TopInset.Value;
             if (bp.BottomInset != null) bottomEmu = bp.BottomInset.Value;
+
+            // autoFit=normal: PowerPoint shrinks text (fontScale) at render
+            // time to fit the shape — there is no real overflow.
+            // autoFit=shape: the shape resizes to fit the text — also no
+            // overflow. Skip the size-based check in both cases.
+            if (bp.GetFirstChild<Drawing.NormalAutoFit>() != null
+                || bp.GetFirstChild<Drawing.ShapeAutoFit>() != null)
+            {
+                return null;
+            }
         }
 
         double usableWidth = shapeWidthPt - (leftEmu + rightEmu) / emuPerPt;
@@ -2362,7 +2530,7 @@ public partial class PowerPointHandler
         // CONSISTENCY(escape-sequences): both \n and \t are interpreted in text=
         // properties cross-handler; resolve here so width estimation matches what
         // PowerPoint will actually render.
-        var textLines = text.Replace("\\n", "\n").Replace("\\t", "\t").Split('\n');
+        var textLines = OfficeCli.Core.TextEscape.Resolve(text).Split('\n');
         int totalLines = 0;
         foreach (var line in textLines)
         {

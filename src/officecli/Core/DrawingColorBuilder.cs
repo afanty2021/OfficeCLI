@@ -21,15 +21,160 @@ internal static class DrawingColorBuilder
     /// </summary>
     internal static OpenXmlElement BuildColorElement(string value)
     {
-        var schemeColor = TryParseSchemeColor(value);
-        if (schemeColor.HasValue)
-            return new Drawing.SchemeColor { Val = schemeColor.Value };
+        // R8-4: split the trailing color transform chain
+        // ("accent1+lumMod50+lumOff20") from the base color before any
+        // recognition. Transforms are appended as a:lumMod / a:lumOff /
+        // a:shade / a:tint / a:satMod / a:satOff / a:hueMod / a:hueOff
+        // children. Pre-R8 these suffixes weren't a vocabulary, so feeding
+        // the round-tripped form back through Set silently failed scheme
+        // recognition.
+        string baseColor = value;
+        List<(string Name, int Val)>? transforms = null;
+        // Accept '+' (canonical Get round-trip form) or ':' (alternate form
+        // some authors reach for when the base is a scheme name). ':' is
+        // reserved for gradient prefixes ("radial:", "path:") and pattern
+        // foreground ("pct25:FF0000"), so we only honour it when the prefix
+        // is a recognised scheme color — otherwise it goes to the gradient
+        // / pattern parser as before.
+        var plus = value.IndexOf('+');
+        if (plus <= 0)
+        {
+            var colon = value.IndexOf(':');
+            if (colon > 0 && TryParseSchemeColor(value.Substring(0, colon)).HasValue)
+                plus = colon;
+        }
+        if (plus > 0)
+        {
+            baseColor = value.Substring(0, plus);
+            // Re-join remaining tokens whether separator was '+' or ':'.
+            transforms = ParseColorTransformSuffix(value.Substring(plus + 1));
+        }
 
-        var (rgb, alpha) = ParseHelpers.SanitizeColorForOoxml(value);
-        var colorEl = new Drawing.RgbColorModelHex { Val = rgb };
-        if (alpha.HasValue)
-            colorEl.AppendChild(new Drawing.Alpha { Val = alpha.Value });
+        OpenXmlElement colorEl;
+        var schemeColor = TryParseSchemeColor(baseColor);
+        if (schemeColor.HasValue)
+        {
+            colorEl = new Drawing.SchemeColor { Val = schemeColor.Value };
+        }
+        else
+        {
+            var (rgb, alpha) = ParseHelpers.SanitizeColorForOoxml(baseColor);
+            var rgbEl = new Drawing.RgbColorModelHex { Val = rgb };
+            if (alpha.HasValue)
+                rgbEl.AppendChild(new Drawing.Alpha { Val = alpha.Value });
+            colorEl = rgbEl;
+        }
+        if (transforms != null)
+            AppendColorTransformChildren(colorEl, transforms);
         return colorEl;
+    }
+
+    // R8-4: parse "lumMod50+lumOff20" → [("lumMod",50),("lumOff",20)]. Each
+    // token is name + integer percent (0..100). Unknown tokens are dropped
+    // silently to keep the input contract lenient — Get emits only the
+    // recognised set above, so a stray suffix is the caller's bug, not ours.
+    private static readonly HashSet<string> KnownTransforms = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "lumMod", "lumOff", "shade", "tint", "satMod", "satOff", "hueMod", "hueOff", "alpha"
+    };
+
+    private static List<(string Name, int Val)> ParseColorTransformSuffix(string chain)
+    {
+        var result = new List<(string Name, int Val)>();
+        foreach (var token in chain.Split('+', StringSplitOptions.RemoveEmptyEntries))
+        {
+            // OOXML ST_PositivePercentage / ST_PositiveFixedPercentage forbids
+            // negative values — every color transform child a:lumMod / a:lumOff
+            // / a:shade / a:tint / a:satMod / a:satOff / a:hueMod / a:hueOff /
+            // a:alpha takes a non-negative percent. Reject "lumMod-50" etc.
+            // explicitly instead of letting the digit-scan land on the digit
+            // after the sign and silently drop the token as "unknown transform".
+            if (token.Contains('-'))
+                throw new ArgumentException(
+                    $"Invalid color transform '{token}': negative percentages are not allowed (OOXML ST_PositivePercentage).");
+            // Two accepted forms:
+            //   "lumMod75"        — Get's canonical round-trip form, percent 0..100
+            //   "lumMod=75000"    — raw OOXML ST_PositivePercentage 0..100000
+            //                       (matches the literal a:lumMod@val attribute,
+            //                        what users see in PowerPoint XML / docs)
+            // Both end up encoded as @val="75000" on the OOXML child.
+            int i = 0;
+            bool eqForm = false;
+            while (i < token.Length && !char.IsDigit(token[i]) && token[i] != '=') i++;
+            if (i == 0 || i == token.Length) continue;
+            var name = token.Substring(0, i);
+            if (!KnownTransforms.Contains(name))
+                throw new ArgumentException(
+                    $"Unknown color transform '{name}'. Valid: lumMod, lumOff, shade, tint, satMod, satOff, hueMod, hueOff, alpha.");
+            string numText;
+            if (token[i] == '=')
+            {
+                eqForm = true;
+                numText = token.Substring(i + 1);
+            }
+            else
+            {
+                numText = token.Substring(i);
+            }
+            if (!int.TryParse(numText, out var raw))
+                throw new ArgumentException(
+                    $"Invalid color transform '{token}': value must be a non-negative integer.");
+            int pct;
+            if (eqForm)
+            {
+                if (raw < 0 || raw > 100000)
+                    throw new ArgumentException(
+                        $"Invalid color transform '{token}': raw value {raw} out of range 0-100000 (OOXML ST_PositivePercentage).");
+                // OOXML raw units are 1/1000 of a percent. Integer division
+                // truncates values 1..999 to 0 (lumMod=75 raw → 0 instead of
+                // 7.5%). Reject sub-1000 raw values so callers can't silently
+                // get a no-op; the percentage form (lumModN, N=0..100) covers
+                // that range with full precision.
+                if (raw > 0 && raw < 1000)
+                    throw new ArgumentException(
+                        $"Invalid color transform '{token}': raw value {raw} below 1000 truncates to 0%; use percentage form '{name}{raw / 1000}' or raw value >= 1000.");
+                pct = raw / 1000;
+            }
+            else
+            {
+                if (raw < 0 || raw > 100)
+                    throw new ArgumentException(
+                        $"Invalid color transform '{token}': percentage {raw} out of range 0-100.");
+                pct = raw;
+            }
+            // Canonicalize: lumMod → lumMod (lowercase first letter? OOXML uses
+            // camelCase: lumMod, lumOff, satMod, satOff, hueMod, hueOff,
+            // shade, tint). KnownTransforms matches case-insensitively; we
+            // re-emit the canonical form here.
+            var canonical = name.ToLowerInvariant() switch
+            {
+                "lummod" => "lumMod",
+                "lumoff" => "lumOff",
+                "satmod" => "satMod",
+                "satoff" => "satOff",
+                "huemod" => "hueMod",
+                "hueoff" => "hueOff",
+                "shade" => "shade",
+                "tint" => "tint",
+                "alpha" => "alpha",
+                _ => name
+            };
+            result.Add((canonical, pct));
+        }
+        return result;
+    }
+
+    private static void AppendColorTransformChildren(OpenXmlElement colorEl, List<(string Name, int Val)> transforms)
+    {
+        const string aNs = "http://schemas.openxmlformats.org/drawingml/2006/main";
+        foreach (var (name, pct) in transforms)
+        {
+            var child = new OpenXmlUnknownElement("a", name, aNs);
+            // OOXML ST_PositivePercentage / ST_FixedPercentage uses 1000ths
+            // of a percent: 100 → 100000, 50 → 50000.
+            child.SetAttribute(new OpenXmlAttribute("", "val", null!, (pct * 1000).ToString()));
+            colorEl.AppendChild(child);
+        }
     }
 
     /// <summary>

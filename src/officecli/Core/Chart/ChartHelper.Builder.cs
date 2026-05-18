@@ -138,14 +138,20 @@ internal static partial class ChartHelper
                 break;
             case "pie" when is3D:
             {
+                // Pie charts vary color by data point, not by series. Writing a
+                // series-level solidFill (via BuildPieSeries(..., color)) overrides
+                // varyColors and renders every slice in one color. Match the 2D
+                // pie path: build the series without a series color, then attach
+                // per-point colors through ApplyDataPointColors.
                 var pie3d = new C.Pie3DChart(
                     new C.VaryColors { Val = true }
                 );
-                for (int i = 0; i < seriesData.Count; i++)
+                if (seriesData.Count > 0)
                 {
-                    var color = colors != null && i < colors.Length ? colors[i] : DefaultSeriesColors[i % DefaultSeriesColors.Length];
-                    pie3d.AppendChild(BuildPieSeries((uint)i, seriesData[i].name,
-                        categories, seriesData[i].values, color));
+                    var series = BuildPieSeries(0, seriesData[0].name,
+                        categories, seriesData[0].values);
+                    ApplyDataPointColors(series, seriesData[0].values.Length, colors);
+                    pie3d.AppendChild(series);
                 }
                 chartElement = pie3d;
                 needsAxes = false;
@@ -778,11 +784,15 @@ internal static partial class ChartHelper
         {
             var ser = BuildScatterSeries((uint)i, seriesData[i].name,
                 xValues, seriesData[i].values);
-            // For marker-only style, explicitly hide connecting lines
+            // For marker-only style, explicitly hide connecting lines.
+            // CT_ScatterSer schema: idx, order, tx, spPr, marker, dPt*, dLbls?,
+            // trendline*, errBars?, xVal?, yVal?, smooth?, extLst? — spPr must
+            // sit right after tx; appending at end loses it on strict readers.
+            // CONSISTENCY(chart-schema-order): route through the same helper used
+            // by per-series fill/line/effect setters.
             if (hideLines)
             {
-                var spPr = ser.GetFirstChild<C.ChartShapeProperties>() ?? new C.ChartShapeProperties();
-                if (ser.GetFirstChild<C.ChartShapeProperties>() == null) ser.AppendChild(spPr);
+                var spPr = GetOrCreateSeriesShapeProperties(ser);
                 spPr.RemoveAllChildren<Drawing.Outline>();
                 spPr.AppendChild(new Drawing.Outline(new Drawing.NoFill()));
             }

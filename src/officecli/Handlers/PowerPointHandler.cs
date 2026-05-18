@@ -17,10 +17,22 @@ public partial class PowerPointHandler : IDocumentHandler
     private uint _nextShapeId = 10000;
     public int LastFindMatchCount { get; internal set; }
 
+    // Backing FileStream when we open via stream (shared-read mode). null
+    // when the package owns its own file handle via PresentationDocument.Open(path).
+    private FileStream? _backingStream;
+
     public PowerPointHandler(string filePath, bool editable)
     {
         _filePath = filePath;
-        _doc = PresentationDocument.Open(filePath, editable);
+        // Open via a shared FileStream so external readers (e.g. test harness
+        // ZipFile.OpenRead while the handler is alive) don't hit the macOS
+        // flock exclusive lock that PresentationDocument.Open(path, editable)
+        // would acquire. The package writes through to the stream; we call
+        // _doc.Save() in Dispose() to flush before closing the stream.
+        var share = editable ? FileShare.Read : FileShare.ReadWrite;
+        var access = editable ? FileAccess.ReadWrite : FileAccess.Read;
+        _backingStream = new FileStream(filePath, FileMode.Open, access, share);
+        _doc = PresentationDocument.Open(_backingStream, editable);
         if (editable)
             InitShapeIdCounter();
     }
@@ -163,8 +175,24 @@ public partial class PowerPointHandler : IDocumentHandler
         {
             var idx = int.Parse(masterMatch.Groups[1].Value);
             var masters = presentationPart.SlideMasterParts.ToList();
-            if (idx < 1 || idx > masters.Count)
+            if (idx < 1)
                 throw new ArgumentException($"SlideMaster {idx} not found (total: {masters.Count})");
+            if (idx > masters.Count)
+            {
+                // CONSISTENCY(grow-on-rawset): mirrors the slideLayout branch.
+                // Source decks with multiple slideMasters (template kits, decks
+                // assembled from several themes) emit raw-set on /slideMaster[2..N];
+                // blank target only stamped /slideMaster[1], so the replay used to
+                // fail every additional master AND every layout owned by those
+                // missing masters. Auto-grow to idx so the raw-set replace has a
+                // root element to swap out; the replace then carries in the real
+                // sldLayoutIdLst, which GrowSlideLayoutParts consults when the
+                // subsequent /slideLayout[K] raw-sets land.
+                GrowSlideMasterParts(idx);
+                masters = presentationPart.SlideMasterParts.ToList();
+                if (idx > masters.Count)
+                    throw new ArgumentException($"SlideMaster {idx} not found (total: {masters.Count})");
+            }
             rootElement = masters[idx - 1].SlideMaster
                 ?? throw new InvalidOperationException("Corrupt file: slide master data missing");
         }
@@ -206,8 +234,42 @@ public partial class PowerPointHandler : IDocumentHandler
         }
         else if (partPath == "/notesMaster")
         {
-            rootElement = presentationPart.NotesMasterPart?.NotesMaster
-                ?? throw new ArgumentException("No notes master part");
+            // CONSISTENCY(grow-on-rawset): blank pptx files have no
+            // NotesMasterPart, but PptxBatchEmitter emits a raw-set /notesMaster
+            // on any deck that has one. Create the part on demand so dump-replay
+            // can stamp the source notes master back in (mirrors GrowSlideLayoutParts
+            // in the slideLayout branch above).
+            var nmPart = presentationPart.NotesMasterPart;
+            if (nmPart == null)
+            {
+                nmPart = presentationPart.AddNewPart<NotesMasterPart>();
+                // Seed a minimal placeholder so the raw-set "replace" action has
+                // a NotesMaster root element to swap out; raw-replace builds the
+                // real content from the supplied XML on the next line.
+                nmPart.NotesMaster = new NotesMaster(
+                    new CommonSlideData(new ShapeTree(
+                        new NonVisualGroupShapeProperties(
+                            new NonVisualDrawingProperties { Id = 1, Name = "" },
+                            new NonVisualGroupShapeDrawingProperties(),
+                            new ApplicationNonVisualDrawingProperties()),
+                        new GroupShapeProperties(new DocumentFormat.OpenXml.Drawing.TransformGroup()))),
+                    new ColorMap
+                    {
+                        Background1 = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Light1,
+                        Text1 = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Dark1,
+                        Background2 = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Light2,
+                        Text2 = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Dark2,
+                        Accent1 = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Accent1,
+                        Accent2 = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Accent2,
+                        Accent3 = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Accent3,
+                        Accent4 = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Accent4,
+                        Accent5 = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Accent5,
+                        Accent6 = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Accent6,
+                        Hyperlink = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Hyperlink,
+                        FollowedHyperlink = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.FollowedHyperlink,
+                    });
+            }
+            rootElement = nmPart.NotesMaster!;
         }
         else
         {
@@ -216,6 +278,37 @@ public partial class PowerPointHandler : IDocumentHandler
 
         var affected = RawXmlHelper.Execute(rootElement, xpath, action, xml);
         rootElement.Save();
+        // After a /slideMaster[N] raw-set the master's <p:sldLayoutIdLst> is
+        // the source's authoritative layout count. Blank decks ship with a
+        // pre-stamped 5-layout master, so a 1-layout source replays to a
+        // 5-layout deck — dump→batch→dump grows from 8 ops to 12 because
+        // the 4 extra blank layouts survive. Prune SlideLayoutParts whose
+        // rId is no longer in the post-replace sldLayoutIdLst so the
+        // replayed deck mirrors the source's layout set exactly. The grow
+        // path (line ~203) handles the opposite case (source has MORE).
+        if (Regex.IsMatch(partPath, @"^/slideMaster\[\d+\]$") && rootElement is SlideMaster sm)
+        {
+            var mp = sm.SlideMasterPart;
+            if (mp != null)
+            {
+                var declaredRids = new HashSet<string>(
+                    sm.SlideLayoutIdList?.Elements<SlideLayoutId>()
+                        .Select(e => e.RelationshipId?.Value ?? "")
+                        .Where(s => !string.IsNullOrEmpty(s))
+                    ?? Enumerable.Empty<string>(),
+                    StringComparer.Ordinal);
+                foreach (var pair in mp.Parts.ToList())
+                {
+                    if (pair.OpenXmlPart is SlideLayoutPart lp
+                        && !declaredRids.Contains(pair.RelationshipId))
+                    {
+                        // The orphan layout's rels (theme/image links etc.) drop
+                        // with the part; DeletePart cascades.
+                        mp.DeletePart(lp);
+                    }
+                }
+            }
+        }
         // BUG-R43: raw-set may have inserted/removed shape XML directly (incl.
         // cNvPr ids). The cached _usedShapeIds set is now stale, so the next
         // Add() can hand out an id that already exists in the tree, producing
@@ -294,6 +387,81 @@ public partial class PowerPointHandler : IDocumentHandler
         // raise the canonical "not found" error after we return.
     }
 
+    // CONSISTENCY(grow-on-rawset): mirror of GrowSlideLayoutParts for the
+    // SlideMasterPart side. Multi-master source decks (template kits, decks
+    // assembled from multiple themes) emit raw-set on /slideMaster[2..N], but
+    // BlankDocCreator only stamps one master. Create enough placeholder
+    // SlideMasterParts (each with a minimal SlideMaster root plus its own
+    // SlideLayoutIdList stub) and register them in the presentation's
+    // sldMasterIdLst so the raw-set replace has a root element to swap, and
+    // so subsequent /slideLayout[K] raw-sets can find their owning master via
+    // GrowSlideLayoutParts.
+    private void GrowSlideMasterParts(int targetIdx)
+    {
+        var presentationPart = _doc.PresentationPart
+            ?? throw new InvalidOperationException("No presentation part");
+        var presentation = presentationPart.Presentation
+            ?? throw new InvalidOperationException("No presentation");
+        var sldMasterIdLst = presentation.SlideMasterIdList
+            ?? throw new InvalidOperationException("Presentation has no SlideMasterIdList");
+
+        var existing = presentationPart.SlideMasterParts.Count();
+        if (targetIdx <= existing) return;
+
+        // Pick a SlideMasterId base that won't collide with the existing IDs.
+        var existingIds = sldMasterIdLst.Elements<SlideMasterId>()
+            .Select(e => e.Id?.Value ?? 0u)
+            .ToHashSet();
+        uint nextId = 2147483648u;
+        while (existingIds.Contains(nextId)) nextId++;
+
+        for (int i = existing; i < targetIdx; i++)
+        {
+            var newPart = presentationPart.AddNewPart<SlideMasterPart>();
+            var rId = presentationPart.GetIdOfPart(newPart);
+            // Minimal SlideMaster root with an empty SlideLayoutIdList so
+            // GrowSlideLayoutParts sees the right declared count once the
+            // imminent raw-set replace overwrites this stub with the real
+            // master XML (which carries the source's actual sldLayoutIdLst).
+            newPart.SlideMaster = new SlideMaster(
+                new CommonSlideData(new ShapeTree(
+                    new NonVisualGroupShapeProperties(
+                        new NonVisualDrawingProperties { Id = 1, Name = "" },
+                        new NonVisualGroupShapeDrawingProperties(),
+                        new ApplicationNonVisualDrawingProperties()),
+                    new GroupShapeProperties(new DocumentFormat.OpenXml.Drawing.TransformGroup()))),
+                new ColorMap
+                {
+                    Background1 = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Light1,
+                    Text1 = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Dark1,
+                    Background2 = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Light2,
+                    Text2 = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Dark2,
+                    Accent1 = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Accent1,
+                    Accent2 = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Accent2,
+                    Accent3 = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Accent3,
+                    Accent4 = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Accent4,
+                    Accent5 = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Accent5,
+                    Accent6 = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Accent6,
+                    Hyperlink = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.Hyperlink,
+                    FollowedHyperlink = DocumentFormat.OpenXml.Drawing.ColorSchemeIndexValues.FollowedHyperlink,
+                },
+                new SlideLayoutIdList()
+            );
+            newPart.SlideMaster.Save();
+
+            // Every SlideMasterPart must reference a ThemePart. The replay's
+            // raw-set replaces only the master XML, not the package
+            // relationships — without a theme link here the package fails
+            // validation. Share the presentation's primary theme; a richer
+            // multi-theme deck can later raw-set its own theme parts.
+            if (presentationPart.ThemePart != null)
+                newPart.AddPart(presentationPart.ThemePart);
+
+            sldMasterIdLst.AppendChild(new SlideMasterId { Id = nextId++, RelationshipId = rId });
+        }
+        presentation.Save();
+    }
+
     public (string RelId, string PartPath) AddPart(string parentPartPath, string partType, Dictionary<string, string>? properties = null)
     {
         var presentationPart = _doc.PresentationPart
@@ -338,7 +506,18 @@ public partial class PowerPointHandler : IDocumentHandler
 
     public List<ValidationError> Validate() => RawXmlHelper.ValidateDocument(_doc);
 
-    public void Dispose() => _doc.Dispose();
+    public void Dispose()
+    {
+        // Save through the package (flush in-memory edits to the underlying
+        // stream) before disposing. When we own the backing FileStream, the
+        // package would otherwise leave the on-disk file in whatever state
+        // the last auto-flush left it — for the stream-Open path this can
+        // truncate to zero bytes and look like a corrupted zip on reopen.
+        try { _doc.Save(); } catch { /* read-only or already disposed */ }
+        _doc.Dispose();
+        _backingStream?.Dispose();
+        _backingStream = null;
+    }
 
     // Internal accessors used by PptxBatchEmitter (resource enumeration).
     // Keep the PresentationPart itself private; expose only the counts and
@@ -349,6 +528,13 @@ public partial class PowerPointHandler : IDocumentHandler
         _doc.PresentationPart?.SlideMasterParts.SelectMany(m => m.SlideLayoutParts).Count() ?? 0;
     internal bool HasNotesMaster =>
         _doc.PresentationPart?.NotesMasterPart != null;
+    // Exposed for PptxBatchEmitter so it can iterate slides without going
+    // through Get("/") — Get("/") fans out into per-slide deep walks that
+    // can throw at SDK validation time on vendor templates with foreign
+    // attributes (gov_bja, 1.pptx, ...). The emitter now uses this count
+    // plus per-slide try/catch to keep the dump going on partial corruption.
+    internal int SlideCount => GetSlideParts().Count();
+
     internal bool SlideHasNotes(int slideIdx)
     {
         var parts = GetSlideParts().ToList();

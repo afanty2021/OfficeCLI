@@ -22,14 +22,11 @@ public partial class WordHandler
     // Tolerant BCP-47 shape used to validate run lang.{val,ea,cs} values.
     // RFC 5646 §2.1: language tag is primary (2-3 ALPHA, or 4-8 ALPHA "reserved"
     // for future / "registered"), followed by hyphen-separated subtags each
-    // 1..8 alphanumerics. Total tag length <= 35 chars (the RFC's practical
-    // ceiling for non-private tags). Also accepts the `x-…` private-use form.
-    // R18-fuzz-3: tightened — old shape `^[A-Za-z][A-Za-z0-9-]*$` accepted
-    // hyphen-less garbage like "INVALID" and 1000-char strings.
-    private const int LangBcp47MaxLength = 35;
-    private static readonly System.Text.RegularExpressions.Regex LangBcp47Shape =
-        new(@"^(?:[A-Za-z]{2,3}(?:-[A-Za-z0-9]{1,8})*|[A-Za-z]{4,8}(?:-[A-Za-z0-9]{1,8})+|x(?:-[A-Za-z0-9]{1,8})+)$",
-            System.Text.RegularExpressions.RegexOptions.Compiled);
+    // CONSISTENCY(bcp47-validation): shape regex moved to Core/Bcp47LanguageTag.cs
+    // so docx and pptx use the same validator. Wrappers kept for readability
+    // of the call sites below.
+    private const int LangBcp47MaxLength = OfficeCli.Core.Bcp47LanguageTag.MaxLength;
+    private static bool LangBcp47IsValid(string value) => OfficeCli.Core.Bcp47LanguageTag.IsValid(value);
 
     /// <summary>
     /// Resolve the OpenXmlPart that owns a given element. Returns the
@@ -1634,10 +1631,19 @@ public partial class WordHandler
             case "kern":
                 // BUG-R7-06: <w:kern w:val="N"/> (kerning threshold in
                 // half-points). Get exposes it; Add/Set silently dropped.
+                // Docx kern unit is half-points (raw uint per ST_HpsMeasure);
+                // unlike pptx kern (100ths of pt) we deliberately do NOT
+                // accept a "pt" suffix here — pass an integer half-points
+                // value. An empty value clears the element; an invalid
+                // value (e.g. "14pt", "abc") returns false so the dispatch
+                // surfaces invalid_value rather than silently no-op'ing.
                 props.RemoveAllChildren<Kern>();
-                if (!string.IsNullOrEmpty(value)
-                    && uint.TryParse(value, out var kernVal))
-                    InsertRunPropInSchemaOrder(props, new Kern { Val = kernVal });
+                if (string.IsNullOrEmpty(value))
+                    return true;
+                if (!uint.TryParse(value, out var kernVal))
+                    throw new ArgumentException(
+                        $"Invalid kern value '{value}'. Pass an integer in half-points (e.g. 28 = 14pt threshold); 'pt' suffix is not accepted on docx kern.");
+                InsertRunPropInSchemaOrder(props, new Kern { Val = kernVal });
                 return true;
             case "position":
                 // <w:position w:val="N"/> — vertical raise/lower in
@@ -1672,7 +1678,7 @@ public partial class WordHandler
                 {
                     if (string.Equals(value, "null", StringComparison.OrdinalIgnoreCase))
                         throw new ArgumentException($"Invalid BCP-47 language tag for {key}: '{value}'. Expected a tag like 'en-US', 'ja-JP', or 'ar-SA'.");
-                    if (value.Length > LangBcp47MaxLength || !LangBcp47Shape.IsMatch(value))
+                    if (!LangBcp47IsValid(value))
                         throw new ArgumentException($"Invalid BCP-47 language tag for {key}: '{value}'. Expected a tag like 'en-US', 'ja-JP', or 'ar-SA' (RFC 5646: <= {LangBcp47MaxLength} chars, primary subtag 2-3 letters, then hyphen-separated subtags).");
                 }
                 var lang = props.GetFirstChild<Languages>();

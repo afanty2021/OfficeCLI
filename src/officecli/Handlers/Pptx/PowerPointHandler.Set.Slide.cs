@@ -45,7 +45,10 @@ public partial class PowerPointHandler
         foreach (var (key, value) in properties)
         {
             if (key.Equals("text", StringComparison.OrdinalIgnoreCase))
+            {
+                XmlTextValidator.ValidateOrThrow(value, "text");
                 SetNotesText(notesPart, value);
+            }
             else if (key.Equals("direction", StringComparison.OrdinalIgnoreCase)
                   || key.Equals("dir", StringComparison.OrdinalIgnoreCase)
                   || key.Equals("rtl", StringComparison.OrdinalIgnoreCase))
@@ -79,7 +82,11 @@ public partial class PowerPointHandler
 
         OpenXmlPart ownerPart;
         OpenXmlPartRootElement rootEl;
-        if (partType.Equals("slidemaster", StringComparison.OrdinalIgnoreCase))
+        // CONSISTENCY(master-layout-path-aliases): accept both `slidemaster` and
+        // short `master`; same for `slidelayout` / `layout`.
+        var isMaster = partType.Equals("slidemaster", StringComparison.OrdinalIgnoreCase)
+                    || partType.Equals("master", StringComparison.OrdinalIgnoreCase);
+        if (isMaster)
         {
             var masters = presentationPart.SlideMasterParts.ToList();
             if (partIdx < 1 || partIdx > masters.Count)
@@ -234,7 +241,11 @@ public partial class PowerPointHandler
                 case "name":
                 {
                     var csd = targetRoot.GetFirstChild<CommonSlideData>();
-                    if (csd != null) csd.Name = value;
+                    if (csd != null)
+                    {
+                        XmlTextValidator.ValidateOrThrow(value, "name");
+                        csd.Name = value;
+                    }
                     break;
                 }
                 case "direction" or "dir" or "rtl":
@@ -339,6 +350,7 @@ public partial class PowerPointHandler
                     break;
                 case "notes":
                 {
+                    XmlTextValidator.ValidateOrThrow(value, "notes");
                     var notesPart = EnsureNotesSlidePart(slidePart2);
                     SetNotesText(notesPart, value);
                     break;
@@ -410,21 +422,16 @@ public partial class PowerPointHandler
                 }
                 case "layout":
                 {
-                    // Change slide layout
+                    // Change slide layout. Route through the single resolver so
+                    // Set accepts the same grammar Add accepts: display name,
+                    // OOXML type token (e.g. "objTx", "blank") or friendly
+                    // alias, and 1-based numeric index. Available-list format
+                    // is shared too — see ResolveSlideLayout / FormatAvailableLayouts.
                     var presentationPart = _doc.PresentationPart
                         ?? throw new InvalidOperationException("No presentation part");
-                    var allLayouts = presentationPart.SlideMasterParts
-                        .SelectMany(m => m.SlideLayoutParts).ToList();
-                    var targetLayout = allLayouts.FirstOrDefault(lp =>
-                        lp.SlideLayout?.CommonSlideData?.Name?.Value?.Equals(value, StringComparison.OrdinalIgnoreCase) == true);
+                    var targetLayout = ResolveSlideLayout(presentationPart, value);
                     if (targetLayout == null)
-                    {
-                        var availableNames = allLayouts
-                            .Select(lp => lp.SlideLayout?.CommonSlideData?.Name?.Value)
-                            .Where(n => n != null)
-                            .ToList();
-                        throw new ArgumentException($"Layout '{value}' not found. Available layouts: {string.Join(", ", availableNames)}");
-                    }
+                        throw new ArgumentException($"Layout '{value}' not found (no layouts defined).");
                     // Point the slide's layout relationship to the new layout
                     if (slidePart2.SlideLayoutPart != null)
                         slidePart2.DeletePart(slidePart2.SlideLayoutPart);

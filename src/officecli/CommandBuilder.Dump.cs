@@ -51,6 +51,19 @@ static partial class CommandBuilder
                 throw new CliException($"dump currently supports .docx and .pptx (got {ext})")
                     { Code = "unsupported_format" };
 
+            // CONSISTENCY(file-not-found): mirror the get/set/query format —
+            // "File not found: <path>. Use 'officecli new <path>' to create a
+            // blank document, or check the file extension.". Without this
+            // early guard the dump path falls through to the SDK opener whose
+            // raw '.NET Could not find file' message disagrees with every
+            // other command and skips the actionable suggestion.
+            if (!File.Exists(file.FullName))
+                throw new CliException(
+                    $"File not found: {file.FullName}. " +
+                    $"Use 'officecli new {file.FullName}' to create a blank document, " +
+                    $"or check the file extension.")
+                    { Code = "file_not_found" };
+
             // BUG-DUMP-R6-01: route through the resident if one holds the file.
             // Without this, dump opens its own handler and collides with
             // the resident's lock ("file being used by another process").

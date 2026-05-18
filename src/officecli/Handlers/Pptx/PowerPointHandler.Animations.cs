@@ -10,6 +10,43 @@ namespace OfficeCli.Handlers;
 
 public partial class PowerPointHandler
 {
+    // ==================== Property Validators (animation) ====================
+    // Centralised validators shared by Add (Add.Misc.AddAnimation) and
+    // Set (Set.Shape.SetShapeAnimationByPath). All throw ArgumentException
+    // on rejection so the framework surfaces a hard error rather than the
+    // composite animValue parser's silent fallback + stderr warning.
+
+    private static readonly HashSet<string> _animClassValues =
+        new(StringComparer.OrdinalIgnoreCase) { "entrance", "exit", "emphasis" };
+
+    internal static void ValidateAnimationClass(string? cls)
+    {
+        if (string.IsNullOrEmpty(cls)) return;
+        if (!_animClassValues.Contains(cls))
+            throw new ArgumentException(
+                $"Invalid animation class: '{cls}'. Valid values: entrance, exit, emphasis.");
+    }
+
+    internal static void ValidateAnimationDuration(string? duration)
+    {
+        if (string.IsNullOrEmpty(duration)) return;
+        var trimmed = duration.Trim();
+        if (!int.TryParse(trimmed, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out var ms) || ms < 0)
+            throw new ArgumentException(
+                $"Invalid animation duration: '{duration}' (expected a non-negative integer in milliseconds, e.g. duration=500).");
+    }
+
+    internal static void ValidateAnimationDelay(string? delay)
+    {
+        if (string.IsNullOrEmpty(delay)) return;
+        var trimmed = delay.Trim();
+        if (!int.TryParse(trimmed, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out var ms) || ms < 0)
+            throw new ArgumentException(
+                $"Invalid animation delay: '{delay}' (expected a non-negative integer in milliseconds, e.g. delay=200).");
+    }
+
     // ==================== Slide Transitions ====================
 
     /// <summary>
@@ -53,6 +90,21 @@ public partial class PowerPointHandler
         string? durationMs = null;
         var dirTokens = new List<string>();
 
+        // Closed set of direction tokens recognized by the per-type Parse*Dir
+        // helpers below. Anything outside this set is fuzz garbage — reject up
+        // front rather than letting "fade-xyz" silently drop "xyz" into
+        // dirTokens (which fade then ignores entirely, producing an envelope
+        // success message for a request the user didn't make).
+        var knownDirTokens = new System.Collections.Generic.HashSet<string>(
+            System.StringComparer.OrdinalIgnoreCase)
+        {
+            "l", "left", "r", "right", "u", "up", "d", "down",
+            "lu", "leftup", "upleft", "ru", "rightup", "upright",
+            "ld", "leftdown", "downleft", "rd", "rightdown", "downright",
+            "in", "out",
+            "h", "horiz", "horizontal", "v", "vert", "vertical",
+            "byobject", "bypage", "byword", "byletter",
+        };
         foreach (var part in parts.Skip(1))
         {
             var p = part.ToLowerInvariant();
@@ -64,8 +116,11 @@ public partial class PowerPointHandler
                 speed = TransitionSpeedValues.Fast;
             else if (p is "medium" or "med")
                 speed = TransitionSpeedValues.Medium;
-            else
+            else if (knownDirTokens.Contains(p))
                 dirTokens.Add(p);
+            else
+                throw new ArgumentException(
+                    $"Invalid transition modifier: '{part}' in '{value}'. Expected a direction (left/right/up/down/in/out/horizontal/vertical/...), a speed (slow/medium/fast), or an integer duration in ms.");
         }
         // Re-join direction tokens with '-' so multi-token forms like
         // "split-vertical-in" preserve both orientation and in/out for
@@ -94,7 +149,12 @@ public partial class PowerPointHandler
             "cover" => new CoverTransition { Direction = ParseSlideDirStr(direction ?? "left") },
             "pull" or "uncover" => new PullTransition { Direction = ParseSlideDirStr(direction ?? "right") },
             "wheel" => new WheelTransition { Spokes = new UInt32Value(4u) },
-            "zoom" or "box" => new ZoomTransition { Direction = ParseInOutDir(direction ?? "in") },
+            "zoom" => new ZoomTransition { Direction = ParseInOutDir(direction ?? "in") },
+            // <p:box> shares CT_OptionalBlackTransition with <p:zoom> but is a distinct
+            // schema element. OpenXml SDK 3.x models only ZoomTransition, so emit <p:box>
+            // via a raw OpenXmlUnknownElement so set transition=box doesn't silently
+            // collapse to the same <p:zoom> XML.
+            "box" => BuildBoxTransition(direction),
             "split" => BuildSplitTransition(direction),
             "blinds" or "venetian" => new BlindsTransition { Direction = ParseOrientation(direction ?? "horizontal") },
             "checker" or "checkerboard" => new CheckerTransition { Direction = ParseOrientation(direction ?? "horizontal") },
@@ -271,10 +331,10 @@ public partial class PowerPointHandler
             "r" or "right" => "r",
             "u" or "up" => "u",
             "d" or "down" => "d",
-            "lu" or "leftup" => "lu",
-            "ru" or "rightup" => "ru",
-            "ld" or "leftdown" => "ld",
-            "rd" or "rightdown" => "rd",
+            "lu" or "leftup" or "upleft" => "lu",
+            "ru" or "rightup" or "upright" => "ru",
+            "ld" or "leftdown" or "downleft" => "ld",
+            "rd" or "rightdown" or "downright" => "rd",
             _ => throw new ArgumentException($"Invalid direction: '{dir}'. Valid values: left, right, up, down, leftup, rightup, leftdown, rightdown.")
         };
 
@@ -312,26 +372,51 @@ public partial class PowerPointHandler
             _ => throw new ArgumentException($"Invalid corner direction: '{dir}'. Valid values: leftup, rightup, leftdown, rightdown.")
         };
 
+    private static OpenXmlUnknownElement BuildBoxTransition(string? direction)
+    {
+        var pNs = "http://schemas.openxmlformats.org/presentationml/2006/main";
+        var box = new OpenXmlUnknownElement("p", "box", pNs);
+        // dir attribute mirrors ZoomTransition: ST_TransitionInOutDirectionType (in/out).
+        var dir = (direction ?? "in").ToLowerInvariant();
+        if (dir != "in" && dir != "out")
+            throw new ArgumentException($"Invalid box transition direction: '{direction}'. Valid values: in, out.");
+        box.SetAttribute(new OpenXmlAttribute("", "dir", null!, dir));
+        return box;
+    }
+
     private static SplitTransition BuildSplitTransition(string? direction)
     {
         var orient = DirectionValues.Horizontal;
-        var inOut = TransitionInOutDirectionValues.In;
+        TransitionInOutDirectionValues? inOut = null;
+        bool orientGiven = false;
         if (direction != null)
         {
             foreach (var token in direction.Split('-', ' '))
             {
                 var t = token.ToLowerInvariant();
                 if (t is "v" or "vert" or "vertical")
-                    orient = DirectionValues.Vertical;
+                { orient = DirectionValues.Vertical; orientGiven = true; }
                 else if (t is "h" or "horz" or "horizontal")
-                    orient = DirectionValues.Horizontal;
+                { orient = DirectionValues.Horizontal; orientGiven = true; }
                 else if (t is "out")
                     inOut = TransitionInOutDirectionValues.Out;
                 else if (t is "in")
                     inOut = TransitionInOutDirectionValues.In;
             }
         }
-        return new SplitTransition { Orientation = orient, Direction = inOut };
+        // Plain set transition=split must produce a distinct XML signature from
+        // split-horizontal-in so readback can tell them apart. The bare form
+        // writes <p:split orient="horz"/> with no dir attribute; the explicit
+        // form keeps writing both attributes. Without this, both inputs landed
+        // on identical XML and readback always returned "split".
+        var split = new SplitTransition { Orientation = orient };
+        if (inOut.HasValue) split.Direction = inOut.Value;
+        // Keep orient on the XML even when the caller didn't pick one — it's the
+        // single attribute that distinguishes split from the bare-no-attr
+        // signature reserved for the future case. orientGiven is consulted only
+        // to leave room for a future fully-bare emit if needed.
+        _ = orientGiven;
+        return split;
     }
 
     // ==================== Shape Animations ====================
@@ -1506,7 +1591,7 @@ public partial class PowerPointHandler
                 "pull"      => "pull",
                 "wheel"     => "wheel",
                 "zoom"      => "zoom",
-                "box"       => "zoom",
+                "box"       => "box",
                 "split"     => "split",
                 "blinds"    => "blinds",
                 "checker"   => "checker",
@@ -1552,12 +1637,15 @@ public partial class PowerPointHandler
     /// </summary>
     private static string? ReadTransitionDirection(OpenXmlElement transElem)
     {
-        // Slide direction transitions: include direction only when non-default
-        // WipeTransition default is Left; PushTransition default is Left
+        // Slide direction transitions: always surface the direction when it was
+        // explicitly written, even when it matches the schema default ("left"),
+        // so set transition=wipe-left round-trips through Get instead of
+        // collapsing back to the bare "wipe" form. CoverTransition already
+        // expands the direction unconditionally — bring wipe/push in line.
         if (transElem is WipeTransition wipe && wipe.Direction?.HasValue == true)
-            return wipe.Direction.Value == TransitionSlideDirectionValues.Left ? null : MapSlideDirection(wipe.Direction.Value);
+            return MapSlideDirection(wipe.Direction.Value);
         if (transElem is PushTransition push && push.Direction?.HasValue == true)
-            return push.Direction.Value == TransitionSlideDirectionValues.Left ? null : MapSlideDirection(push.Direction.Value);
+            return MapSlideDirection(push.Direction.Value);
         if (transElem is CoverTransition cover && cover.Direction != null)
             return ExpandDirectionAbbreviation(cover.Direction.Value?.ToLowerInvariant());
         if (transElem is PullTransition pull && pull.Direction != null)
@@ -1567,15 +1655,17 @@ public partial class PowerPointHandler
         if (transElem is ZoomTransition zoom && zoom.Direction?.HasValue == true)
             return zoom.Direction.Value == TransitionInOutDirectionValues.Out ? "out" : null;
 
-        // Split: orientation + in/out (default: horizontal-in)
+        // Split: surface orientation + in/out only when the source XML carried
+        // both attributes. Bare <p:split orient="horz"/> (no dir) round-trips
+        // through Get as plain "split"; explicit forms (e.g. split-horizontal-in)
+        // carry both attributes and read back with the qualifier intact.
         if (transElem is SplitTransition split)
         {
+            if (split.Direction?.HasValue != true) return null;
             var orient = split.Orientation?.HasValue == true && split.Orientation.Value == DirectionValues.Vertical
                 ? "vertical" : "horizontal";
-            var dir = split.Direction?.HasValue == true && split.Direction.Value == TransitionInOutDirectionValues.Out
-                ? "out" : "in";
-            var combined = $"{orient}-{dir}";
-            return combined == "horizontal-in" ? null : combined;
+            var dir = split.Direction.Value == TransitionInOutDirectionValues.Out ? "out" : "in";
+            return $"{orient}-{dir}";
         }
 
         // Orientation-based: blinds, checker, comb, randombar (default: horizontal)

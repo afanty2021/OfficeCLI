@@ -31,6 +31,13 @@ public partial class PowerPointHandler
                 OpenXmlPart ownerPart;
                 OpenXmlPartRootElement ownerRoot;
                 string returnPathPrefix;
+                // CONSISTENCY(group-inner-shape-add): when the parent is a group,
+                // newShape is appended to the GroupShape rather than the slide's
+                // ShapeTree. shapeTree still points at the slide root for helpers
+                // that need slide-wide context (shape-id allocation, query for
+                // morph naming); insertContainer is what InsertAtPosition writes to.
+                OpenXmlCompositeElement? insertContainer = null;
+                string? groupResultPathPrefix = null;
 
                 var masterOrLayout = TryResolveMasterOrLayoutShapeParent(parentPath);
                 if (masterOrLayout is not null)
@@ -43,26 +50,54 @@ public partial class PowerPointHandler
                 }
                 else
                 {
-                    var slideMatch = Regex.Match(parentPath, @"^/slide\[(\d+)\]$");
-                    if (!slideMatch.Success)
-                        throw new ArgumentException(
-                            $"Shapes must be added to a slide, master, or layout: /slide[N], /slidemaster[N], /slidelayout[N], or /slidemaster[N]/slidelayout[L]");
+                    // /slide[N]/group[K] — add the shape inside the group, not at
+                    // slide root. Required by dump-replay: empty groups are emitted
+                    // first, then per-child `add shape parent=/slide/group[K]`.
+                    var groupParentMatch = Regex.Match(parentPath, @"^/slide\[(\d+)\]/group\[(\d+)\]$");
+                    if (groupParentMatch.Success)
+                    {
+                        slideIdx = int.Parse(groupParentMatch.Groups[1].Value);
+                        var grpIdx = int.Parse(groupParentMatch.Groups[2].Value);
+                        slideParts = GetSlideParts().ToList();
+                        if (slideIdx < 1 || slideIdx > slideParts.Count)
+                            throw new ArgumentException($"Slide {slideIdx} not found (total: {slideParts.Count})");
+                        slidePart = slideParts[slideIdx - 1];
+                        var slideG = GetSlide(slidePart);
+                        shapeTree = slideG.CommonSlideData?.ShapeTree
+                            ?? throw new InvalidOperationException("Slide has no shape tree");
+                        var groups = shapeTree.Elements<GroupShape>().ToList();
+                        if (grpIdx < 1 || grpIdx > groups.Count)
+                            throw new ArgumentException($"Group {grpIdx} not found on slide {slideIdx} (total: {groups.Count})");
+                        insertContainer = groups[grpIdx - 1];
+                        ownerPart = slidePart;
+                        ownerRoot = slideG;
+                        returnPathPrefix = $"/slide[{slideIdx}]";
+                        groupResultPathPrefix = $"/slide[{slideIdx}]/group[{grpIdx}]";
+                    }
+                    else
+                    {
+                        var slideMatch = Regex.Match(parentPath, @"^/slide\[(\d+)\]$");
+                        if (!slideMatch.Success)
+                            throw new ArgumentException(
+                                $"Shapes must be added to a slide, master, layout, or group: /slide[N], /slide[N]/group[K], /slidemaster[N], /slidelayout[N], or /slidemaster[N]/slidelayout[L]");
 
-                    slideIdx = int.Parse(slideMatch.Groups[1].Value);
-                    slideParts = GetSlideParts().ToList();
-                    if (slideIdx < 1 || slideIdx > slideParts.Count)
-                        throw new ArgumentException($"Slide {slideIdx} not found (total: {slideParts.Count})");
+                        slideIdx = int.Parse(slideMatch.Groups[1].Value);
+                        slideParts = GetSlideParts().ToList();
+                        if (slideIdx < 1 || slideIdx > slideParts.Count)
+                            throw new ArgumentException($"Slide {slideIdx} not found (total: {slideParts.Count})");
 
-                    slidePart = slideParts[slideIdx - 1];
-                    var slide = GetSlide(slidePart);
-                    shapeTree = slide.CommonSlideData?.ShapeTree
-                        ?? throw new InvalidOperationException("Slide has no shape tree");
-                    ownerPart = slidePart;
-                    ownerRoot = slide;
-                    returnPathPrefix = $"/slide[{slideIdx}]";
+                        slidePart = slideParts[slideIdx - 1];
+                        var slide = GetSlide(slidePart);
+                        shapeTree = slide.CommonSlideData?.ShapeTree
+                            ?? throw new InvalidOperationException("Slide has no shape tree");
+                        ownerPart = slidePart;
+                        ownerRoot = slide;
+                        returnPathPrefix = $"/slide[{slideIdx}]";
+                    }
                 }
 
                 var text = properties.GetValueOrDefault("text", "");
+                XmlTextValidator.ValidateOrThrow(text, "text");
                 var shapeId = AcquireShapeId(shapeTree, properties);
                 var shapeName = properties.GetValueOrDefault("name", $"TextBox {shapeTree.Elements<Shape>().Count() + 1}");
 
@@ -381,21 +416,34 @@ public partial class PowerPointHandler
                 {
                     long xEmu = 0, yEmu = 0;
                     long cxEmu = 3600000, cyEmu = 1800000; // default: 10cm x 5cm (avoid full-slide overlap when width unspecified)
-                    if (properties.TryGetValue("x", out var xStr) || properties.TryGetValue("left", out xStr)) xEmu = ParseEmu(xStr);
-                    if (properties.TryGetValue("y", out var yStr) || properties.TryGetValue("top", out yStr)) yEmu = ParseEmu(yStr);
+                    // Unified bounds check: PowerPoint truncates EMU coordinates
+                    // past INT32_MAX (cx/cy schema-typed as int32 in practice).
+                    // Error prefix "Invalid" so OutputFormatter routes the
+                    // ArgumentException to invalid_value, mirroring Set's path.
+                    static long ParseEmuBounded(string raw, string field, bool allowNegative)
+                    {
+                        var v = ParseEmu(raw);
+                        if (!allowNegative && v < 0)
+                            throw new ArgumentException($"Invalid {field} '{raw}': negative values are not allowed.");
+                        if (v > int.MaxValue)
+                            throw new ArgumentException($"Invalid {field} '{raw}': exceeds the maximum supported shape coordinate (INT32_MAX EMU).");
+                        if (allowNegative && v < int.MinValue)
+                            throw new ArgumentException($"Invalid {field} '{raw}': below the minimum supported shape coordinate (INT32_MIN EMU).");
+                        return v;
+                    }
+                    if (properties.TryGetValue("x", out var xStr) || properties.TryGetValue("left", out xStr)) xEmu = ParseEmuBounded(xStr, "x", allowNegative: true);
+                    if (properties.TryGetValue("y", out var yStr) || properties.TryGetValue("top", out yStr)) yEmu = ParseEmuBounded(yStr, "y", allowNegative: true);
                     if (properties.TryGetValue("width", out var wStr) || properties.TryGetValue("w", out wStr))
                     {
-                        cxEmu = ParseEmu(wStr);
-                        if (cxEmu < 0) throw new ArgumentException($"Negative width is not allowed: '{wStr}'.");
                         // Zero is legitimate (PowerPoint hides 0×0 shapes — used for invisible
                         // decorative lines). Dump-replay must round-trip zero-sized shapes that
                         // were authored that way; the prior strict reject broke real-world
                         // round-trips.
+                        cxEmu = ParseEmuBounded(wStr, "width", allowNegative: false);
                     }
                     if (properties.TryGetValue("height", out var hStr) || properties.TryGetValue("h", out hStr))
                     {
-                        cyEmu = ParseEmu(hStr);
-                        if (cyEmu < 0) throw new ArgumentException($"Negative height is not allowed: '{hStr}'.");
+                        cyEmu = ParseEmuBounded(hStr, "height", allowNegative: false);
                     }
 
                     var xfrm = new Drawing.Transform2D
@@ -405,8 +453,7 @@ public partial class PowerPointHandler
                     };
                     if (properties.TryGetValue("rotation", out var rotVal) || properties.TryGetValue("rotate", out rotVal))
                     {
-                        if (!double.TryParse(rotVal, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var rotDbl) || double.IsNaN(rotDbl) || double.IsInfinity(rotDbl))
-                            throw new ArgumentException($"Invalid 'rotation' value: '{rotVal}'. Expected a finite number in degrees (e.g. 45, -90, 180.5).");
+                        var rotDbl = ParseHelpers.SafeParseRotationDegrees(rotVal!, "rotation");
                         xfrm.Rotation = (int)(rotDbl * 60000);
                     }
                     newShape.ShapeProperties!.Transform2D = xfrm;
@@ -436,8 +483,15 @@ public partial class PowerPointHandler
                         // erroring out (we'd lose the shape entirely otherwise).
                         if (presetName.Equals("custom", StringComparison.OrdinalIgnoreCase))
                             presetName = "rect";
+                        // Validate the preset name so an unknown geometry
+                        // surfaces unsupported_property instead of silently
+                        // degrading to rect. Mirrors the Set path
+                        // (ShapeProperties.cs uses TryParsePresetShape for
+                        // the same reason).
+                        if (!TryParsePresetShape(presetName, out var presetGeom))
+                            throw new ArgumentException($"Unknown shape geometry: '{presetName}'");
                         newShape.ShapeProperties.AppendChild(
-                            new Drawing.PresetGeometry(new Drawing.AdjustValueList()) { Preset = ParsePresetShape(presetName) }
+                            new Drawing.PresetGeometry(new Drawing.AdjustValueList()) { Preset = presetGeom }
                         );
                     }
                 }
@@ -481,7 +535,15 @@ public partial class PowerPointHandler
                             "so the alpha value has a color element to attach to.");
                     if (double.TryParse(opacityVal, System.Globalization.CultureInfo.InvariantCulture, out var alphaNum))
                     {
-                        if (alphaNum > 1.0) alphaNum /= 100.0; // treat >1 as percentage (e.g. 30 → 0.30)
+                        // CONSISTENCY(opacity-clamp): (1, 2) ambiguous; see
+                        // the shape Set path. Reject before the /100.
+                        if (alphaNum > 1.0 && alphaNum < 2.0)
+                            throw new ArgumentException(
+                                $"Invalid 'opacity' value: '{opacityVal}'. Expected 0.0-1.0 as decimal or 2-100 as percent (values in (1, 2) are ambiguous).");
+                        if (alphaNum > 1.0) alphaNum /= 100.0; // treat >=2 as percentage (e.g. 30 → 0.30)
+                        if (alphaNum < 0.0 || alphaNum > 1.0)
+                            throw new ArgumentException(
+                                $"Invalid 'opacity' value: '{opacityVal}'. Expected 0.0-1.0 (or 0-100 as percent).");
                         var alphaPct = (int)(alphaNum * 100000);
                         var solidFill = newShape.ShapeProperties?.GetFirstChild<Drawing.SolidFill>();
                         if (solidFill != null)
@@ -585,7 +647,16 @@ public partial class PowerPointHandler
                     }
                 }
 
-                InsertAtPosition(shapeTree, newShape, index);
+                if (insertContainer != null)
+                {
+                    // Group container — InsertAtPosition over a GroupShape: the
+                    // existing helper is shape-tree generic so it works here too.
+                    InsertAtPosition(insertContainer, newShape, index);
+                }
+                else
+                {
+                    InsertAtPosition(shapeTree, newShape, index);
+                }
 
                 // Hyperlink on shape — slide-only. ApplyShapeHyperlink uses
                 // SlidePart.AddHyperlinkRelationship; master/layout owner parts
@@ -655,7 +726,27 @@ public partial class PowerPointHandler
                     ApplyShapeAnimation(slidePart, newShape, animVal);
                 }
 
+                // Z-order — slide-only. NodeBuilder emits the 1-based position
+                // among content elements; without consuming it here every Add
+                // appended at the end of the shape tree and dump-replay lost
+                // the original stacking order.
+                if (slidePart != null && (
+                    properties.TryGetValue("zorder", out var zVal)
+                    || properties.TryGetValue("z-order", out zVal)
+                    || properties.TryGetValue("order", out zVal)))
+                {
+                    ApplyZOrder(slidePart, newShape, zVal);
+                }
+
                 ownerRoot.Save();
+                if (groupResultPathPrefix != null && insertContainer != null)
+                {
+                    // Positional within the group container: 1-based shape index
+                    // among Shape children of the GroupShape, matching the format
+                    // emitted by Get for /slide/group/shape paths.
+                    var inGroupIdx = insertContainer.Elements<Shape>().Count();
+                    return $"{groupResultPathPrefix}/{BuildElementPathSegment("shape", newShape, inGroupIdx)}";
+                }
                 return $"{returnPathPrefix}/{BuildElementPathSegment("shape", newShape, shapeTree.Elements<Shape>().Count())}";
     }
 

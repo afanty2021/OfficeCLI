@@ -598,11 +598,26 @@ public class ResidentServer : IDisposable
                 // emitted success=true while exit code went to 1 — exactly the
                 // mismatch the non-resident path was already broken for.
                 var businessSuccess = !(batchFailure || validateFailure);
-                var envelope = IsJson(stdout)
-                    ? OutputFormatter.WrapEnvelope(stdout, warnings, success: businessSuccess)
-                    : isFailure
-                        ? OutputFormatter.WrapEnvelopeError(stdout, warnings)
-                        : OutputFormatter.WrapEnvelopeText(stdout, warnings, success: businessSuccess);
+                // If the sub-command already produced a top-level envelope
+                // (json object with a `success` field — set/add/get/dump all
+                // do this via WrapEnvelope*), forward it unchanged. Rewrapping
+                // here used to nest the inner envelope under `data`, producing
+                // a {success, data:{success, data:...}} double envelope. Only
+                // merge warnings/businessSuccess into the existing envelope
+                // for judgment commands whose verdict the resident layer adds.
+                string envelope;
+                if (IsAlreadyWrappedEnvelope(stdout))
+                {
+                    envelope = MergeIntoExistingEnvelope(stdout, warnings, batchFailure || validateFailure);
+                }
+                else
+                {
+                    envelope = IsJson(stdout)
+                        ? OutputFormatter.WrapEnvelope(stdout, warnings, success: businessSuccess)
+                        : isFailure
+                            ? OutputFormatter.WrapEnvelopeError(stdout, warnings)
+                            : OutputFormatter.WrapEnvelopeText(stdout, warnings, success: businessSuccess);
+                }
                 // BUG-R11-03: JSON-mode exit code must match text mode. Previously
                 // hard-coded to 0, which silently swallowed every error type
                 // (path-not-found, unsupported_property, failed open) for any
@@ -675,6 +690,56 @@ public class ResidentServer : IDisposable
         catch
         {
             return true; // malformed — don't synthesize a failure
+        }
+    }
+
+    // Detect an envelope already minted by CommandBuilder.* (set/add/get/dump
+    // call WrapEnvelope*). Rewrapping such payloads nested them under `data`,
+    // producing {success, data:{success, ...}}. Heuristic: top-level JSON
+    // object with a boolean `success` field — same contract WrapEnvelope* emits
+    // and that EnvelopeSuccess already keys off.
+    private static bool IsAlreadyWrappedEnvelope(string s)
+    {
+        if (!IsJson(s)) return false;
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(s);
+            if (doc.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object) return false;
+            if (!doc.RootElement.TryGetProperty("success", out var succ)) return false;
+            return succ.ValueKind == System.Text.Json.JsonValueKind.True
+                || succ.ValueKind == System.Text.Json.JsonValueKind.False;
+        }
+        catch { return false; }
+    }
+
+    // Forward the inner envelope unchanged but: (a) flip success=false if the
+    // resident layer detected a batch/validate verdict failure the sub-command
+    // didn't surface, (b) append our stderr-derived warnings to the existing
+    // warnings array. No restructure of `data`/`message`/`error`.
+    private static string MergeIntoExistingEnvelope(string envelopeJson, List<CliWarning>? extraWarnings, bool forceFailure)
+    {
+        try
+        {
+            var node = System.Text.Json.Nodes.JsonNode.Parse(envelopeJson);
+            if (node is not System.Text.Json.Nodes.JsonObject obj) return envelopeJson;
+            if (forceFailure) obj["success"] = false;
+            if (extraWarnings is { Count: > 0 })
+            {
+                if (obj["warnings"] is System.Text.Json.Nodes.JsonArray existing)
+                {
+                    foreach (var w in extraWarnings)
+                        existing.Add(System.Text.Json.JsonSerializer.SerializeToNode(w, AppJsonContext.Default.CliWarning));
+                }
+                else
+                {
+                    obj["warnings"] = System.Text.Json.JsonSerializer.SerializeToNode(extraWarnings, AppJsonContext.Default.ListCliWarning);
+                }
+            }
+            return obj.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+        }
+        catch
+        {
+            return envelopeJson;
         }
     }
 
@@ -874,6 +939,11 @@ public class ResidentServer : IDisposable
             }
         }
 
+        // Judgment contract: batch is classified as a judgment command (root
+        // CLAUDE.md "Judgment: any batch step failed -> outer false"). The
+        // verdict flips to failure as soon as ANY step is rejected. Keeps
+        // envelope.success / exit code in lockstep with the non-resident
+        // path.
         _lastBatchHadFailure = results.Any(r => !r.Success);
         CommandBuilder.PrintBatchResults(results, json, items.Count);
     }
@@ -1219,29 +1289,57 @@ public class ResidentServer : IDisposable
                     Console.Error.WriteLine("Forms view is only supported for .docx files.");
             }
             else
-                Console.WriteLine($"Unknown mode: {mode}. Available: text, annotated, outline, stats, issues, html, svg, screenshot, forms");
+                // Unknown mode is a caller bug, not a successful view: throw
+                // the same CliException CommandBuilder.View.cs raises in the
+                // direct-mode path so the envelope reports success=false /
+                // code=invalid_value instead of stdout-ing the error message
+                // as the view payload.
+                throw new OfficeCli.Core.CliException($"Unknown mode: {mode}. Available: text, annotated, outline, stats, issues, html, svg, screenshot, forms")
+                {
+                    Code = "invalid_value",
+                    ValidValues = ["text", "annotated", "outline", "stats", "issues", "html", "svg", "screenshot", "pdf", "forms"]
+                };
         }
         else
         {
-            var output = mode!.ToLowerInvariant() switch
+            var modeKey = mode!.ToLowerInvariant();
+            string output;
+            switch (modeKey)
             {
-                "text" or "t" => _handler.ViewAsText(start, end, maxLines, cols),
-                "annotated" or "a" => _handler.ViewAsAnnotated(start, end, maxLines, cols),
-                "outline" or "o" => _handler.ViewAsOutline(),
-                "stats" or "s" => pageCountValue.HasValue
-                    ? $"Pages: {pageCountValue}\n" + _handler.ViewAsStats()
-                    : _handler.ViewAsStats(),
-                "issues" or "i" => OutputFormatter.FormatIssues(_handler.ViewAsIssues(issueType, limit), format),
-                "forms" or "f" => _handler switch
-                {
-                    OfficeCli.Handlers.WordHandler wfh => wfh.ViewAsForms(),
-                    OfficeCli.Core.Plugins.FormatHandlerProxy fp
-                        => fp.ViewAsFormsJson()?.ToJsonString(OutputFormatter.PublicJsonOptions)
-                           ?? "Forms view is not supported by the format-handler plugin.",
-                    _ => "Forms view is only supported for .docx files."
-                },
-                _ => $"Unknown mode: {mode}. Available: text, annotated, outline, stats, issues, html, svg, screenshot, forms"
-            };
+                case "text" or "t":
+                    output = _handler.ViewAsText(start, end, maxLines, cols); break;
+                case "annotated" or "a":
+                    output = _handler.ViewAsAnnotated(start, end, maxLines, cols); break;
+                case "outline" or "o":
+                    output = _handler.ViewAsOutline(); break;
+                case "stats" or "s":
+                    output = pageCountValue.HasValue
+                        ? $"Pages: {pageCountValue}\n" + _handler.ViewAsStats()
+                        : _handler.ViewAsStats(); break;
+                case "issues" or "i":
+                    output = OutputFormatter.FormatIssues(_handler.ViewAsIssues(issueType, limit), format); break;
+                case "forms" or "f":
+                    output = _handler switch
+                    {
+                        OfficeCli.Handlers.WordHandler wfh => wfh.ViewAsForms(),
+                        OfficeCli.Core.Plugins.FormatHandlerProxy fp
+                            => fp.ViewAsFormsJson()?.ToJsonString(OutputFormatter.PublicJsonOptions)
+                               ?? throw new OfficeCli.Core.CliException("Forms view is not supported by the format-handler plugin.")
+                                   { Code = "unsupported_type" },
+                        _ => throw new OfficeCli.Core.CliException("Forms view is only supported for .docx files.")
+                        {
+                            Code = "unsupported_type",
+                            ValidValues = ["text", "annotated", "outline", "stats", "issues", "html", "svg", "screenshot", "pdf", "forms"]
+                        }
+                    };
+                    break;
+                default:
+                    throw new OfficeCli.Core.CliException($"Unknown mode: {mode}. Available: text, annotated, outline, stats, issues, html, svg, screenshot, forms")
+                    {
+                        Code = "invalid_value",
+                        ValidValues = ["text", "annotated", "outline", "stats", "issues", "html", "svg", "screenshot", "pdf", "forms"]
+                    };
+            }
             Console.WriteLine(output);
         }
     }
@@ -1397,8 +1495,18 @@ public class ResidentServer : IDisposable
                 $"path '{path}' must start with '/'. Did you mean '/{path}'?");
 
         var unsupported = _handler.Set(path, properties);
+        // CONSISTENCY(unsupported-key-extract): mirrored in CommandBuilder.Set.cs.
+        // Handler entries may be "key (reason)" or "key=value (reason)" (e.g.
+        // geometry=invalid_preset). Trim trailing help text, then strip the
+        // optional "=value" so the membership test below matches the raw
+        // property key in `properties`.
         var unsupportedKeys = unsupported
-            .Select(u => u.Contains(' ') ? u[..u.IndexOf(' ')] : u)
+            .Select(u =>
+            {
+                var head = u.Contains(' ') ? u[..u.IndexOf(' ')] : u;
+                var eq = head.IndexOf('=');
+                return eq >= 0 ? head[..eq] : head;
+            })
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var applied = properties.Where(kv => !unsupportedKeys.Contains(kv.Key)).ToList();
 

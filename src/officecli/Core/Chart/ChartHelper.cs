@@ -88,18 +88,26 @@ internal static partial class ChartHelper
     }
 
     /// <summary>
-    /// Returns true if the value looks like a single cell reference (A1, $A$1, Sheet1!A1,
-    /// Sheet1!$A$1) or a single-cell range (A1:A1, Sheet1!A1:A1). Used to detect when
-    /// a series.name parameter should be emitted as a c:strRef instead of literal c:v.
+    /// Returns true if the value looks like a single cell reference with an
+    /// explicit sheet prefix (Sheet1!A1, Sheet1!$A$1, 'My Sheet'!A1:A1). Used
+    /// to detect when a series.name / chart title parameter should be emitted
+    /// as a c:strRef instead of literal c:v.
+    ///
+    /// Bare cell-shaped tokens (e.g. "Q1", "A1", "B2") are deliberately NOT
+    /// treated as cell references — they collide with common literal labels
+    /// (quarter codes, product names) and emitting a strRef without an
+    /// external workbook backing causes real PowerPoint to render no title /
+    /// no series name at all (data loss). Callers wanting a cell reference
+    /// must qualify with the sheet name.
     /// </summary>
     internal static bool IsCellReference(string value)
     {
         if (string.IsNullOrWhiteSpace(value)) return false;
         var trimmed = value.Trim();
-        // Optional sheet prefix (Sheet1! or 'Sheet with spaces'!), single cell A1 or $A$1,
-        // optionally followed by :A1 range of size 1.
+        // Mandatory sheet prefix (Sheet1! or 'Sheet with spaces'!), single
+        // cell A1 or $A$1, optionally followed by :A1 range of size 1.
         return System.Text.RegularExpressions.Regex.IsMatch(trimmed,
-            @"^(?:'[^']+'!|[A-Za-z_][\w\.]*!)?\$?[A-Za-z]+\$?\d+(?::\$?[A-Za-z]+\$?\d+)?$");
+            @"^(?:'[^']+'!|[A-Za-z_][\w\.]*!)\$?[A-Za-z]+\$?\d+(?::\$?[A-Za-z]+\$?\d+)?$");
     }
 
     /// <summary>

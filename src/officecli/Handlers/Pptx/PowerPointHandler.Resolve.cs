@@ -53,7 +53,24 @@ public partial class PowerPointHandler
         var chartRef = gf.Descendants<DocumentFormat.OpenXml.Drawing.Charts.ChartReference>().FirstOrDefault();
         ChartPart? chartPart = null;
         if (chartRef?.Id?.Value != null)
-            chartPart = (ChartPart)slidePart.GetPartById(chartRef.Id.Value);
+        {
+            // Broken c:chart/@r:id (relationship missing from the slide part —
+            // happens after a hand-edited zip or a partially-imported deck) makes
+            // GetPartById throw the SDK's bare ArgumentOutOfRangeException
+            // ("Specified argument was out of the range of valid values.") with
+            // no rId context. Surface a CliException with a stable code and the
+            // offending rId so callers can route to repair instead of guessing.
+            try
+            {
+                chartPart = (ChartPart)slidePart.GetPartById(chartRef.Id.Value);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                throw new CliException(
+                    $"Chart relationship '{chartRef.Id.Value}' on slide {slideIdx} points to a missing part. The chart's r:id has no matching relationship in the slide's rels file.")
+                    { Code = "broken_chart_relationship" };
+            }
+        }
 
         // cx:chart (extended) reference — note: the SDK has TWO classes that
         // both serialize with LocalName "chart":
@@ -76,7 +93,18 @@ public partial class PowerPointHandler
                 var relIdAttr = cxChartRef.GetAttributes()
                     .FirstOrDefault(a => a.LocalName == "id" && a.NamespaceUri == rNs);
                 if (!string.IsNullOrEmpty(relIdAttr.Value))
-                    extChartPart = (ExtendedChartPart)slidePart.GetPartById(relIdAttr.Value);
+                {
+                    try
+                    {
+                        extChartPart = (ExtendedChartPart)slidePart.GetPartById(relIdAttr.Value);
+                    }
+                    catch (ArgumentOutOfRangeException)
+                    {
+                        throw new CliException(
+                            $"Extended chart relationship '{relIdAttr.Value}' on slide {slideIdx} points to a missing part.")
+                            { Code = "broken_chart_relationship" };
+                    }
+                }
             }
         }
 
@@ -426,11 +454,19 @@ public partial class PowerPointHandler
     // ==================== Layout ====================
 
     /// <summary>
-    /// Resolve a SlideLayoutPart by name, type, or index.
-    /// If layoutHint is null, returns the first layout.
-    /// Matching order: exact name → layout type → numeric index → first layout.
+    /// Resolve a SlideLayoutPart by name, type token, or numeric index. Single
+    /// entry point for the layout-selection grammar used by both Add (new slide)
+    /// and Set (re-layout existing slide). If layoutHint is null/empty, returns
+    /// the first layout. Matching order:
+    ///   1. exact display name (CommonSlideData.Name) or MatchingName
+    ///   2. layout type token — raw OOXML enum InnerText (e.g. "objTx", "blank",
+    ///      "title", "twoObj") AND friendly aliases ("titlecontent",
+    ///      "twocontent", "section", …)
+    ///   3. 1-based numeric index across all masters
+    ///   4. case-insensitive substring match on display name
+    /// Throws ArgumentException with a unified available-list string on miss.
     /// </summary>
-    private static SlideLayoutPart? ResolveSlideLayout(PresentationPart presentationPart, string? layoutHint)
+    internal static SlideLayoutPart? ResolveSlideLayout(PresentationPart presentationPart, string? layoutHint)
     {
         var allLayouts = presentationPart.SlideMasterParts
             .SelectMany(m => m.SlideLayoutParts).ToList();
@@ -450,7 +486,14 @@ public partial class PowerPointHandler
         });
         if (byName != null) return byName;
 
-        // 2. Match by layout type keyword
+        // 2a. Match by raw OOXML enum InnerText (e.g. "objTx", "blank", "title")
+        // — what Get emits as Format["layoutType"], so it round-trips.
+        var byRawType = allLayouts.FirstOrDefault(lp =>
+            lp.SlideLayout?.Type?.HasValue == true &&
+            string.Equals(lp.SlideLayout.Type.InnerText, layoutHint, StringComparison.OrdinalIgnoreCase));
+        if (byRawType != null) return byRawType;
+
+        // 2b. Match by friendly layout type alias
         var layoutType = layoutHint.ToLowerInvariant() switch
         {
             "title"                                     => SlideLayoutValues.Title,
@@ -487,13 +530,20 @@ public partial class PowerPointHandler
 
         throw new ArgumentException(
             $"Layout '{layoutHint}' not found. Available layouts: " +
-            string.Join(", ", allLayouts.Select((lp, i) =>
-            {
-                var name = lp.SlideLayout?.CommonSlideData?.Name?.Value ?? "(unnamed)";
-                var type = lp.SlideLayout?.Type?.HasValue == true ? lp.SlideLayout.Type.InnerText : "?";
-                return $"[{i + 1}] {name} ({type})";
-            })));
+            FormatAvailableLayouts(allLayouts));
     }
+
+    /// <summary>
+    /// Unified available-layouts list used in Add/Set error messages so the
+    /// grammar surface (name | type | index) is discoverable from either path.
+    /// </summary>
+    internal static string FormatAvailableLayouts(IEnumerable<SlideLayoutPart> allLayouts)
+        => string.Join(", ", allLayouts.Select((lp, i) =>
+        {
+            var name = lp.SlideLayout?.CommonSlideData?.Name?.Value ?? "(unnamed)";
+            var type = lp.SlideLayout?.Type?.HasValue == true ? lp.SlideLayout.Type.InnerText : "?";
+            return $"[{i + 1}] {name} ({type})";
+        }));
 
     /// <summary>
     /// Get the layout name for a slide part.
