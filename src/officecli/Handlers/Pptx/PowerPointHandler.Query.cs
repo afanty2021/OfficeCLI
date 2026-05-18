@@ -147,6 +147,16 @@ public partial class PowerPointHandler
                 + (shapeTree?.Elements<Picture>().Count() ?? 0);
             masterNode.Format["shapeCount"] = shapeCount;
             ReadBackground(mp.SlideMaster?.CommonSlideData, masterNode);
+            // CONSISTENCY(master-direction): Set persists rtl into the master's
+            // <p:txStyles>/bodyStyle/lvl1pPr@rtl. Mirror it back on Get so users
+            // can verify their own write (was previously set-only — Get omitted
+            // the key entirely).
+            var smTxStyles = mp.SlideMaster?.TextStyles;
+            var rtlVal = smTxStyles?.GetFirstChild<BodyStyle>()?.GetFirstChild<Drawing.Level1ParagraphProperties>()?.RightToLeft?.Value
+                ?? smTxStyles?.GetFirstChild<TitleStyle>()?.GetFirstChild<Drawing.Level1ParagraphProperties>()?.RightToLeft?.Value
+                ?? smTxStyles?.GetFirstChild<OtherStyle>()?.GetFirstChild<Drawing.Level1ParagraphProperties>()?.RightToLeft?.Value;
+            if (rtlVal == true)
+                masterNode.Format["direction"] = "rtl";
             // Add layout children
             int lIdx = 0;
             foreach (var lp in mp.SlideLayoutParts ?? Enumerable.Empty<SlideLayoutPart>())
