@@ -2437,6 +2437,16 @@ public partial class PowerPointHandler
             if (bp.RightInset != null) rightEmu = bp.RightInset.Value;
             if (bp.TopInset != null) topEmu = bp.TopInset.Value;
             if (bp.BottomInset != null) bottomEmu = bp.BottomInset.Value;
+
+            // autoFit=normal: PowerPoint shrinks text (fontScale) at render
+            // time to fit the shape — there is no real overflow.
+            // autoFit=shape: the shape resizes to fit the text — also no
+            // overflow. Skip the size-based check in both cases.
+            if (bp.GetFirstChild<Drawing.NormalAutoFit>() != null
+                || bp.GetFirstChild<Drawing.ShapeAutoFit>() != null)
+            {
+                return null;
+            }
         }
 
         double usableWidth = shapeWidthPt - (leftEmu + rightEmu) / emuPerPt;
