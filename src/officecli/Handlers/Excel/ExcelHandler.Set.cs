@@ -18,6 +18,7 @@ public partial class ExcelHandler
 {
     public List<string> Set(string path, Dictionary<string, string> properties)
     {
+        Modified = true;
         // Batch Set: if path looks like a selector (not starting with /), Query → Set each
         if (!string.IsNullOrEmpty(path) && !path.StartsWith("/"))
         {
@@ -365,9 +366,11 @@ public partial class ExcelHandler
                     // Auto-detect formula: value starting with '=' is treated as formula
                     if (effectiveValue.StartsWith('=') && effectiveValue.Length > 1)
                         goto case "formula";
-                    // CONSISTENCY(escape-sequences): mirror PPTX/Word — interpret
-                    // \n and \t two-char escapes as real newline / tab.
-                    var cellValue = OfficeCli.Core.TextEscape.Resolve(effectiveValue);
+                    // CONSISTENCY(text-escape-boundary): \n / \t resolution is
+                    // applied at the CLI --prop parse boundary
+                    // (CommandBuilder.ParsePropsArray); the value arrives here
+                    // with real newlines/tabs already decoded.
+                    var cellValue = effectiveValue;
                     // Warn when overwriting an existing formula with a literal value.
                     // Without this, `set --prop value=N` on a formula cell silently
                     // drops the formula — the same conflict-class as supplying both
@@ -422,6 +425,16 @@ public partial class ExcelHandler
                         // R13-2: accept date-with-time variants (T and space separators).
                         if (!explicitTypeIsString && TryParseIsoDateFlexible(cellValue, out var dt))
                         {
+                            // Excel's date serial epoch is 1899-12-30 (preserving the
+                            // 1900 leap bug). Dates earlier than that map to negative
+                            // serials, which Excel renders as ####### or silently
+                            // clamps to the epoch — neither is what the user asked
+                            // for. Reject up front so the round-trip is honest
+                            // instead of writing serial 0 and reading back "1899-12-30".
+                            if (dt < new System.DateTime(1900, 1, 1))
+                                throw new ArgumentException(
+                                    $"Cannot store '{cellValue}' as date; Excel does not support dates before 1900-01-01 " +
+                                    $"(serial epoch is 1899-12-30). Use type=string to keep the literal text.");
                             cell.CellValue = new CellValue(dt.ToOADate().ToString(System.Globalization.CultureInfo.InvariantCulture));
                             cell.DataType = null;
                             if (!properties.ContainsKey("numberformat") && !properties.ContainsKey("numfmt") && !properties.ContainsKey("format"))
@@ -513,8 +526,20 @@ public partial class ExcelHandler
                         evalResult = inner;
                     if (evalResult is { IsNumeric: true })
                     {
-                        cell.CellValue = new CellValue(evalResult.ToCellValueText());
-                        cell.DataType = null;
+                        // IEEE-754 ±Infinity / NaN have no OOXML representation;
+                        // writing "<v>-Infinity</v>" produces a file Excel refuses
+                        // to open. Promote to #NUM! so the cell switches to t="e".
+                        var nv = evalResult.NumericValue!.Value;
+                        if (double.IsNaN(nv) || double.IsInfinity(nv))
+                        {
+                            cell.CellValue = new CellValue("#NUM!");
+                            cell.DataType = new DocumentFormat.OpenXml.EnumValue<CellValues>(CellValues.Error);
+                        }
+                        else
+                        {
+                            cell.CellValue = new CellValue(evalResult.ToCellValueText());
+                            cell.DataType = null;
+                        }
                     }
                     else if (evalResult is { IsString: true })
                     {

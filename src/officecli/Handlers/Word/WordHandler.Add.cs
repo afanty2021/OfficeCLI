@@ -17,6 +17,7 @@ public partial class WordHandler
 {
     public string Add(string parentPath, string type, InsertPosition? position, Dictionary<string, string> properties)
     {
+        Modified = true;
         // The signature is non-nullable, but the body uses `type?.Equals(...)`
         // below to short-circuit header/footer routing — that null-conditional
         // makes the C# flow analyzer treat `type` as nullable from that point
@@ -42,6 +43,7 @@ public partial class WordHandler
         // (currently only AddStyle) populate this; the CLI layer surfaces
         // it as a WARNING line so curated-surface gaps stop being silent.
         LastAddUnsupportedProps = new List<string>();
+        LastAddWarnings = new List<string>();
 
         // Reject negative --index up front with a clean message instead of
         // letting it fall through and surface as a raw .NET
@@ -687,7 +689,12 @@ public partial class WordHandler
                                 Edit = new EnumValue<DocumentProtectionValues>(editValue),
                                 Enforcement = new OnOffValue(true)
                             };
-                            protSettingsPart.Settings.AppendChild(prot);
+                            // CONSISTENCY(settings-schema-order): w:documentProtection
+                            // must precede w:compat / w:charSpacingControl in w:settings
+                            // (CT_Settings sequence). Plain AppendChild lands after
+                            // any pre-existing compat block and fails OOXML validation
+                            // (R12 minor). Reuse the existing helper.
+                            InsertBeforeCompatibility(protSettingsPart.Settings, prot);
                         }
                     }
 

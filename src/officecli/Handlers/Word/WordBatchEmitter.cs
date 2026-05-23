@@ -124,7 +124,8 @@ public static partial class WordBatchEmitter
             }).ToList(),
             ChartCursor: new NoteCursor(),
             ParaIdToTargetIdx: new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase),
-            DeferredBookmarks: new List<BatchItem>());
+            DeferredBookmarks: new List<BatchItem>(),
+            TextboxCounters: new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase));
 
         if (node.Type == "table")
             EmitTable(word, path, 1, items, ctx);
@@ -298,7 +299,14 @@ public static partial class WordBatchEmitter
         // and that sibling does not exist yet during the in-order walk.
         // EmitParagraph stashes the deferred `add bookmark` rows here;
         // EmitBody appends them once all paragraphs are emitted.
-        List<BatchItem> DeferredBookmarks);
+        List<BatchItem> DeferredBookmarks,
+        // BUG-DUMP-TXBX: per-host textbox counter. Keyed by the host path
+        // ("/body", "/body/tbl[1]/tr[1]/tc[1]", "/header[N]", "/footer[N]").
+        // TryEmitPictureRun bumps this when it identifies a textbox-bearing
+        // Drawing and uses the post-bump value as N for /<host>/textbox[N].
+        // Matches the CountTextboxesInHost selector on the Add side so dump
+        // and Add-side indexing stay in lockstep.
+        Dictionary<string, int> TextboxCounters);
 
     private static void EmitBody(WordHandler word, List<BatchItem> items,
                                  Dictionary<string, int>? paraIdToTargetIdx = null)
@@ -344,7 +352,8 @@ public static partial class WordBatchEmitter
             ChartSpecs: chartSpecs,
             ChartCursor: new NoteCursor(),
             ParaIdToTargetIdx: paraIdToTargetIdx,
-            DeferredBookmarks: new List<BatchItem>());
+            DeferredBookmarks: new List<BatchItem>(),
+            TextboxCounters: new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase));
 
         int pIndex = 0, tblIndex = 0;
         foreach (var child in bodyNode.Children)
@@ -385,6 +394,34 @@ public static partial class WordBatchEmitter
                     break;
                 case "sdt":
                     EmitSdt(word, child.Path, items);
+                    break;
+                case "bookmark":
+                    // Standalone body-level <w:bookmarkStart> (e.g. an anchor
+                    // added with `add /body --type bookmark`). Inline bookmarks
+                    // inside paragraphs are handled by EmitParagraph; without
+                    // this case, body-level bookmark anchors were silently
+                    // dropped on dump.
+                    {
+                        var bmFull = word.Get(child.Path);
+                        var bmProps = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                        if (bmFull.Format.TryGetValue("name", out var nm)
+                            && nm != null && !string.IsNullOrEmpty(nm.ToString()))
+                            bmProps["name"] = nm.ToString()!;
+                        else
+                            break; // BookmarkStart with no name is unusable
+                        items.Add(new BatchItem
+                        {
+                            Command = "add",
+                            Parent = "/body",
+                            Type = "bookmark",
+                            Props = bmProps
+                        });
+                    }
+                    break;
+                case "bookmarkEnd":
+                    // Paired with the body-level bookmarkStart emit above. The
+                    // matching `add bookmark` re-creates start+end together so
+                    // the standalone end node needs no emit.
                     break;
                 case "equation":
                     // BUG-DUMP13-03: a bare <m:oMathPara> direct child of

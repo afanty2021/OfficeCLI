@@ -1,14 +1,10 @@
 // Copyright 2025 OfficeCLI (officecli.ai)
 // SPDX-License-Identifier: Apache-2.0
 
-using System.Text.RegularExpressions;
 using DocumentFormat.OpenXml;
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Presentation;
 using OfficeCli.Core;
-using Drawing = DocumentFormat.OpenXml.Drawing;
-using C = DocumentFormat.OpenXml.Drawing.Charts;
-using M = DocumentFormat.OpenXml.Math;
 
 namespace OfficeCli.Handlers;
 
@@ -70,7 +66,14 @@ public partial class PowerPointHandler
                 if (properties.TryGetValue("text", out var contentText))
                 {
                     XmlTextValidator.ValidateOrThrow(contentText, "text");
-                    var textShape = CreateTextShape(nextShapeId++, "Content", contentText, false);
+                    // Symmetry with the title path above: title carries
+                    // <p:ph type="title"/>, so content carries
+                    // <p:ph type="body" idx="1"/> — both bind to layout
+                    // slots and Get reports them as placeholder-flavored
+                    // (title → type=title; content → type=placeholder +
+                    // phType=body) instead of mismatched title vs bare textbox.
+                    var textShape = CreateTextShape(nextShapeId++, "Content", contentText, false, isTextBox: true,
+                        placeholderType: PlaceholderValues.Body, placeholderIndex: 1);
                     newSlidePart.Slide.CommonSlideData!.ShapeTree!.AppendChild(textShape);
                 }
 

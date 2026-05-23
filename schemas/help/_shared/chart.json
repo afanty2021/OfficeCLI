@@ -513,7 +513,7 @@
         "zero",
         "span"
       ],
-      "add": false,
+      "add": true,
       "set": true,
       "get": true,
       "description": "how empty cells render (gap leaves a hole, zero plots as 0, span connects across).",
@@ -547,11 +547,11 @@
       "add": true,
       "set": true,
       "get": false,
-      "description": "error bars on each series. Format: 'type:value' where type ∈ fixedVal, percentage, stdDev, stdErr, custom. 'none' removes.",
+      "description": "error bars on each series. Format: 'type:value' where type ∈ fixed (alias: fixedValue), percent (alias: percentage, pct), stddev (alias: standardDeviation), stderr (alias: standardError). 'none' removes.",
       "examples": [
-        "--prop errbars=fixedVal:5",
+        "--prop errbars=fixed:5",
         "--prop errbars=none",
-        "--prop errbars=percentage:10"
+        "--prop errbars=percent:10"
       ]
     },
     "explosion": {
@@ -751,10 +751,34 @@
       "add": true,
       "set": true,
       "get": false,
-      "description": "data label text font. Format: 'size:color:fontname' (any segment optional).",
+      "description": "data label text font. Format: 'size:color:fontname' (any segment optional). Readback is split into labelFont.size / labelFont.color / labelFont.bold / labelFont.name (one key per slot) so dump→replay can rebuild the compound spec without parsing.",
       "examples": [
         "--prop labelfont=9:333333:Calibri"
       ]
+    },
+    "labelFont.size": {
+      "type": "number",
+      "get": true,
+      "description": "data label font size in points. Readback of the size slot inside labelfont= (BuildLabelTextProperties' DefaultRunProperties.FontSize).",
+      "examples": []
+    },
+    "labelFont.color": {
+      "type": "string",
+      "get": true,
+      "description": "data label font color (hex, e.g. #FF0000). Readback of the color slot inside labelfont=.",
+      "examples": []
+    },
+    "labelFont.bold": {
+      "type": "bool",
+      "get": true,
+      "description": "data label font bold flag. Emitted only when true.",
+      "examples": []
+    },
+    "labelFont.name": {
+      "type": "string",
+      "get": true,
+      "description": "data label font typeface (latin). Readback of the fontname slot inside labelfont=.",
+      "examples": []
     },
     "labeloffset": {
       "type": "number",
@@ -928,7 +952,7 @@
       "add": true,
       "set": true,
       "get": false,
-      "description": "marker symbol for line/scatter/radar series only (other types silently skipped). Format: 'symbol' or 'symbol:size' or 'symbol:size:color'. Symbols: none, auto, circle, square, diamond, triangle, x, plus, star, dash, dot, picture. Chart-level Get does not surface marker because applicability is chart-type-conditional — read per-series via /chart[N]/series[K] (chart-series schema declares marker get:true).",
+      "description": "marker symbol for line/scatter/radar series only (other types silently skipped). Format: 'symbol' or 'symbol:size' or 'symbol:size:color'. Symbols: none, auto, circle, square, diamond, triangle, x, plus, star, dash, dot. (picture markers are not implemented.) Chart-level Get does not surface marker because applicability is chart-type-conditional — read per-series via /chart[N]/series[K] (chart-series schema declares marker get:true).",
       "examples": [
         "--prop marker=circle",
         "--prop marker=square:8:FF0000"
@@ -944,6 +968,19 @@
       "examples": [
         "--prop markersize=8"
       ]
+    },
+    "markercolor": {
+      "type": "string",
+      "aliases": [
+        "marker.color"
+      ],
+      "set": true,
+      "get": true,
+      "description": "marker fill color (line/scatter/radar series only). Fans out to every applicable series; preserves existing marker symbol/size. Read back from the first series' marker spPr/solidFill.",
+      "examples": [
+        "--prop markerColor=FF0000"
+      ],
+      "readback": "as emitted by handler (hex color, e.g. #FF0000)"
     },
     "minorGridlines": {
       "type": "bool",
@@ -1384,7 +1421,7 @@
     },
     "varyColors": {
       "type": "string",
-      "add": false,
+      "add": true,
       "set": true,
       "get": true,
       "description": "vary colors by data point (true|false; single-series charts).",

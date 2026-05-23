@@ -90,6 +90,7 @@ public partial class PowerPointHandler
                     slideNode.Format["hidden"] = true;
                 ReadSlideBackground(GetSlide(slidePart), slideNode);
                 ReadSlideTransition(slidePart, slideNode);
+                ReadSlideHeaderFooter(GetSlide(slidePart), slideNode);
 
                 if (depth > 0)
                 {
@@ -307,6 +308,18 @@ public partial class PowerPointHandler
             return oleNodes[oleNodeIdx - 1];
         }
 
+        // Modern p188 comment reply: /slide[N]/moderncomment[K]/reply[R].
+        // (Top-level /slide[N]/moderncomment[K] is matched by the generic
+        // /slide[N]/<type>[K] branch below via elementType == "moderncomment".)
+        var mcReplyGetMatch = Regex.Match(path,
+            @"^/slide\[(\d+)\]/moderncomment\[(\d+)\]/reply\[(\d+)\]$", RegexOptions.IgnoreCase);
+        if (mcReplyGetMatch.Success)
+        {
+            var rr = ResolveModernCommentReply(path)
+                ?? throw new ArgumentException($"Modern comment reply not found: {path}");
+            return ModernCommentReplyToNode(rr.slideIdx, rr.parentIdx, rr.reply, rr.replyIdx);
+        }
+
         // Try notes path: /slide[N]/notes
         var notesGetMatch = Regex.Match(path, @"^/slide\[(\d+)\]/notes$");
         if (notesGetMatch.Success)
@@ -390,9 +403,11 @@ public partial class PowerPointHandler
             var qParaPProps = para.ParagraphProperties;
             if (qParaPProps?.Alignment?.HasValue == true) paraNode.Format["align"] = NormalizeAlignment(qParaPProps.Alignment.InnerText!);
             if (qParaPProps?.Level?.HasValue == true) paraNode.Format["level"] = qParaPProps.Level.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
-            if (qParaPProps?.Indent?.HasValue == true) paraNode.Format["indent"] = FormatEmu(qParaPProps.Indent.Value);
-            if (qParaPProps?.LeftMargin?.HasValue == true) paraNode.Format["marginLeft"] = FormatEmu(qParaPProps.LeftMargin.Value);
-            if (qParaPProps?.RightMargin?.HasValue == true) paraNode.Format["marginRight"] = FormatEmu(qParaPProps.RightMargin.Value);
+            // CONSISTENCY(pptx-bare-as-points): indent readback is unit-qualified
+            // in points to round-trip with bare-number Add/Set input.
+            if (qParaPProps?.Indent?.HasValue == true) paraNode.Format["indent"] = FormatPptIndentPoints(qParaPProps.Indent.Value);
+            if (qParaPProps?.LeftMargin?.HasValue == true) paraNode.Format["marginLeft"] = FormatPptIndentPoints(qParaPProps.LeftMargin.Value);
+            if (qParaPProps?.RightMargin?.HasValue == true) paraNode.Format["marginRight"] = FormatPptIndentPoints(qParaPProps.RightMargin.Value);
             var qLsPct = qParaPProps?.GetFirstChild<Drawing.LineSpacing>()?.GetFirstChild<Drawing.SpacingPercent>()?.Val?.Value;
             if (qLsPct.HasValue) paraNode.Format["lineSpacing"] = SpacingConverter.FormatPptLineSpacingPercent(qLsPct.Value);
             var qLsPts = qParaPProps?.GetFirstChild<Drawing.LineSpacing>()?.GetFirstChild<Drawing.SpacingPoints>()?.Val?.Value;
@@ -459,21 +474,57 @@ public partial class PowerPointHandler
             return Model3DToNode(m3dElements[mIdx - 1], sIdx, mIdx);
         }
 
-        // Try animation path: /slide[N]/shape[M]/animation[A]
-        var animPathMatch = Regex.Match(path, @"^/slide\[(\d+)\]/shape\[(\d+)\]/animation\[(\d+)\]$");
+        // Try animation path: /slide[N]/(shape|chart)[M]/animation[A]
+        // CONSISTENCY(animation-target): same enumeration model for shapes and
+        // chart graphicFrames — only the resolver differs.
+        var animPathMatch = Regex.Match(path, @"^/slide\[(\d+)\]/(shape|chart)\[(\d+)\]/animation\[(\d+)\]$");
         if (animPathMatch.Success)
         {
             var sIdx = int.Parse(animPathMatch.Groups[1].Value);
-            var shIdx = int.Parse(animPathMatch.Groups[2].Value);
-            var aIdx = int.Parse(animPathMatch.Groups[3].Value);
-            var (animSlidePart, animShape) = ResolveShape(sIdx, shIdx);
-            var animShapePathSeg = BuildElementPathSegment("shape", animShape, shIdx);
+            var animKind = animPathMatch.Groups[2].Value;
+            var elIdx = int.Parse(animPathMatch.Groups[3].Value);
+            var aIdx = int.Parse(animPathMatch.Groups[4].Value);
 
-            var effectCTns = EnumerateShapeAnimationCTns(animSlidePart, animShape);
+            SlidePart animSlidePart;
+            OpenXmlElement animTargetEl;
+            string animElPathSeg;
+            if (animKind == "chart")
+            {
+                var (sp, gf, _, _) = ResolveChart(sIdx, elIdx);
+                animSlidePart = sp;
+                animTargetEl = gf;
+                animElPathSeg = BuildElementPathSegment("chart", gf, elIdx);
+            }
+            else
+            {
+                var (sp, sh) = ResolveShape(sIdx, elIdx);
+                animSlidePart = sp;
+                animTargetEl = sh;
+                animElPathSeg = BuildElementPathSegment("shape", sh, elIdx);
+            }
+
+            var effectCTns = EnumerateShapeAnimationCTns(animSlidePart, animTargetEl);
             if (aIdx < 1 || aIdx > effectCTns.Count)
-                return new DocumentNode { Path = path, Type = "error", Text = $"animation[{aIdx}] not found (shape has {effectCTns.Count} animation(s))" };
-            var animNode = new DocumentNode { Path = $"/slide[{sIdx}]/{animShapePathSeg}/animation[{aIdx}]", Type = "animation" };
+                return new DocumentNode { Path = path, Type = "error", Text = $"animation[{aIdx}] not found ({animKind} has {effectCTns.Count} animation(s))" };
+            var animNode = new DocumentNode { Path = $"/slide[{sIdx}]/{animElPathSeg}/animation[{aIdx}]", Type = "animation" };
             PopulateAnimationNode(animNode, effectCTns[aIdx - 1]);
+            // chartBuild surfaces on the per-animation node too, mirroring the
+            // chart-parent Get readback. Pulled from the matching BuildGraphics
+            // by spid (one bldGraphic per chart spid in v1).
+            if (animKind == "chart")
+            {
+                var spIdStr = GetAnimationTargetSpId(animTargetEl)?.ToString();
+                if (spIdStr != null)
+                {
+                    var bldGraphic = GetSlide(animSlidePart).GetFirstChild<Timing>()?.BuildList?
+                        .Elements<BuildGraphics>().FirstOrDefault(b => b.ShapeId?.Value == spIdStr);
+                    if (bldGraphic != null)
+                    {
+                        var bldVal = bldGraphic.BuildSubElement?.BuildChart?.Build?.Value;
+                        animNode.Format["chartBuild"] = string.IsNullOrEmpty(bldVal) ? "asWhole" : bldVal;
+                    }
+                }
+            }
             return animNode;
         }
 
@@ -1011,6 +1062,7 @@ public partial class PowerPointHandler
                 slideNode.Format["hidden"] = true;
             ReadSlideBackground(slide, slideNode);
             ReadSlideTransition(targetSlidePart, slideNode);
+            ReadSlideHeaderFooter(slide, slideNode);
             if (targetSlidePart.NotesSlidePart != null)
             {
                 var notesText = GetNotesText(targetSlidePart.NotesSlidePart);
@@ -1039,6 +1091,14 @@ public partial class PowerPointHandler
             if (elementIdx < 1 || elementIdx > comments.Count)
                 throw new ArgumentException($"Comment {elementIdx} not found (total: {comments.Count})");
             return CommentToNode(targetSlidePart, slideIdx, comments[elementIdx - 1], elementIdx);
+        }
+
+        // Modern p188 threaded comments live in PowerPointCommentPart(s).
+        if (elementType == "moderncomment")
+        {
+            var top = ResolveModernComment($"/slide[{slideIdx}]/moderncomment[{elementIdx}]")
+                ?? throw new ArgumentException($"Modern comment {elementIdx} not found on slide {slideIdx}");
+            return ModernCommentToNode(slideIdx, top.comment, elementIdx);
         }
 
         if (elementType == "shape")
@@ -1247,6 +1307,8 @@ public partial class PowerPointHandler
                 or "tc" or "cell" or "tr" or "row"
                 // BUG-R36-B11: query("comment") enumerates all slide comments.
                 or "comment"
+                // Modern p188 threaded comments.
+                or "moderncomment" or "modern-comment" or "thread" or "threadedcomment"
                 // R8-8: paragraph/run as root selectors — walk every shape's
                 // text body and emit one node per paragraph or run, matching
                 // the docx surface where query("run") returns all body runs.
@@ -1300,6 +1362,7 @@ public partial class PowerPointHandler
                     slideNode.Format["hidden"] = true;
                 ReadSlideBackground(sld, slideNode);
                 ReadSlideTransition(sp, slideNode);
+                ReadSlideHeaderFooter(sld, slideNode);
                 if (sp.NotesSlidePart != null)
                 {
                     var notesText = GetNotesText(sp.NotesSlidePart);
@@ -1350,6 +1413,23 @@ public partial class PowerPointHandler
             var slideFilter = parsed.SlideNum;
             var commentNodes = EnumerateComments(slideFilter);
             foreach (var n in commentNodes)
+            {
+                if (parsed.TextContains != null
+                    && !(n.Text ?? "").Contains(parsed.TextContains, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (MatchesGenericAttributes(n, parsed.Attributes))
+                    results.Add(n);
+            }
+            return results;
+        }
+
+        // Modern p188 threaded comments — enumerate top-level threads
+        // (replies live as children of each top-level node).
+        if (rawType is "moderncomment" or "modern-comment" or "thread" or "threadedcomment")
+        {
+            var slideFilter = parsed.SlideNum;
+            var mcNodes = EnumerateModernComments(slideFilter);
+            foreach (var n in mcNodes)
             {
                 if (parsed.TextContains != null
                     && !(n.Text ?? "").Contains(parsed.TextContains, StringComparison.OrdinalIgnoreCase))
@@ -1533,6 +1613,38 @@ public partial class PowerPointHandler
                             Type = "animation"
                         };
                         PopulateAnimationNode(node, effectCTns[ai]);
+                        if (MatchesGenericAttributes(node, parsed.Attributes))
+                            results.Add(node);
+                    }
+                }
+
+                // CONSISTENCY(animation-target): chart graphicFrames are
+                // first-class animation targets — enumerate them under the
+                // same query so `query animation` returns chart animations too.
+                int animChartIdx = 0;
+                foreach (var animGf in animShapeTree.Elements<GraphicFrame>())
+                {
+                    if (!IsChartGraphicFrame(animGf)) continue;
+                    animChartIdx++;
+                    var effectCTns = EnumerateShapeAnimationCTns(slidePart, animGf);
+                    if (effectCTns.Count == 0) continue;
+                    var chartPathSeg = BuildElementPathSegment("chart", animGf, animChartIdx);
+                    var chartSpId = GetAnimationTargetSpId(animGf)?.ToString();
+                    var bldGraphic = chartSpId == null ? null
+                        : GetSlide(slidePart).GetFirstChild<Timing>()?.BuildList?
+                            .Elements<BuildGraphics>().FirstOrDefault(b => b.ShapeId?.Value == chartSpId);
+                    var chartBuildVal = bldGraphic == null ? null
+                        : (bldGraphic.BuildSubElement?.BuildChart?.Build?.Value
+                            ?? "asWhole");
+                    for (int ai = 0; ai < effectCTns.Count; ai++)
+                    {
+                        var node = new DocumentNode
+                        {
+                            Path = $"/slide[{animSlideNum}]/{chartPathSeg}/animation[{ai + 1}]",
+                            Type = "animation"
+                        };
+                        PopulateAnimationNode(node, effectCTns[ai]);
+                        if (chartBuildVal != null) node.Format["chartBuild"] = chartBuildVal;
                         if (MatchesGenericAttributes(node, parsed.Attributes))
                             results.Add(node);
                     }
@@ -1840,21 +1952,94 @@ public partial class PowerPointHandler
     // ==================== Animation helpers ====================
 
     /// <summary>
-    /// Returns the ordered list of entrance/exit/emphasis effect CommonTimeNodes for the given shape.
-    /// Motion-path animations (presetClass="motion") are excluded.
+    /// Returns the ordered list of effect CommonTimeNodes for the given shape,
+    /// including entrance/exit/emphasis presets (PresetClass set) and motion-path
+    /// effects (presetClass="motion" raw attribute, no SDK enum). L3 sub-B
+    /// promoted motion paths into this list so animation[K] indexing covers
+    /// every animation surface on the shape.
+    /// CONSISTENCY(animation-chain): Add/Set/Get/Remove all rely on this single
+    /// enumeration order — keep the predicate in sync with what each writer
+    /// emits (ApplyShapeAnimation + AppendMotionPathAnimation).
     /// </summary>
-    private List<CommonTimeNode> EnumerateShapeAnimationCTns(SlidePart slidePart, Shape shape)
+    private List<CommonTimeNode> EnumerateShapeAnimationCTns(SlidePart slidePart, OpenXmlElement target)
     {
-        var shapeId = shape.NonVisualShapeProperties?.NonVisualDrawingProperties?.Id?.Value;
+        var shapeId = GetAnimationTargetSpId(target);
         if (shapeId == null) return [];
         var timing = GetSlide(slidePart).GetFirstChild<Timing>();
         if (timing == null) return [];
         var shapeIdStr = shapeId.Value.ToString();
-        return timing.Descendants<CommonTimeNode>()
-            .Where(ctn => ctn.PresetClass != null && ctn.PresetId != null &&
-                   ctn.GetAttributes().All(a => a.LocalName != "presetClass" || a.Value != "motion") &&
-                   ctn.Descendants<ShapeTarget>().Any(st => st.ShapeId?.Value == shapeIdStr))
+        var allEffect = timing.Descendants<CommonTimeNode>()
+            .Where(ctn =>
+            {
+                if (!ctn.Descendants<ShapeTarget>().Any(st => st.ShapeId?.Value == shapeIdStr))
+                    return false;
+                // Regular entrance/exit/emphasis: SDK PresetClass set + PresetId set.
+                if (ctn.PresetClass != null && ctn.PresetId != null) return true;
+                // Motion path: SDK has no enum for "motion", so it's stored as a
+                // raw attribute and PresetClass parses to null. Match via the
+                // raw attribute + AnimateMotion descendant.
+                var rawCls = ctn.GetAttributes()
+                    .FirstOrDefault(a => a.LocalName == "presetClass").Value;
+                if (rawCls == "motion" && ctn.Descendants<AnimateMotion>().Any())
+                    return true;
+                return false;
+            })
             .ToList();
+        // Dedupe by GroupId: one user-visible animation = one grpId. Chart
+        // per-element entrances fan out to N+1 click-groups all sharing one
+        // grpId; the user sees a single "By Series" / "By Category" entry in
+        // PowerPoint's Animation Pane. Pick the first cTn carrying a non-gridLegend
+        // step (so Get/Set surfaces an effect with a meaningful target), falling
+        // back to the first cTn when only a header is present.
+        // Shape animations (each with a unique grpId) collapse to one entry per
+        // grpId — behaviourally unchanged from the pre-fan-out enumeration.
+        // CONSISTENCY(animation-chart-fanout).
+        var byGroup = new Dictionary<uint, CommonTimeNode>();
+        var withoutGroup = new List<CommonTimeNode>();
+        foreach (var ctn in allEffect)
+        {
+            var gid = ctn.GroupId?.Value;
+            if (!gid.HasValue) { withoutGroup.Add(ctn); continue; }
+            if (!byGroup.TryGetValue(gid.Value, out var current))
+            {
+                byGroup[gid.Value] = ctn;
+                continue;
+            }
+            // Prefer a cTn whose target is NOT a gridLegend header (i.e. the
+            // first real data step) so PopulateAnimationNode surfaces the
+            // user-meaningful effect rather than the chart's frame fade-in.
+            bool currentIsHead = HasGridLegendTarget(current);
+            bool candIsHead = HasGridLegendTarget(ctn);
+            if (currentIsHead && !candIsHead) byGroup[gid.Value] = ctn;
+        }
+        // Preserve encounter order across the original list.
+        var result = new List<CommonTimeNode>();
+        var seenGroups = new HashSet<uint>();
+        foreach (var ctn in allEffect)
+        {
+            var gid = ctn.GroupId?.Value;
+            if (!gid.HasValue) continue;
+            if (!seenGroups.Add(gid.Value)) continue;
+            result.Add(byGroup[gid.Value]);
+        }
+        result.AddRange(withoutGroup);
+        return result;
+    }
+
+    // True iff the given effect cTn's animation targets are all the chart's
+    // gridLegend header (seriesIdx=-3, categoryIdx=-3, bldStep="gridLegend").
+    // Used to dedupe chart per-element click-group fan-outs so the user-visible
+    // animation refers to the first real data step, not the header.
+    private static bool HasGridLegendTarget(CommonTimeNode ctn)
+    {
+        // Drawing.Chart (a:chart) is the animation-target chart element, distinct
+        // from Drawing.Charts.Chart (c:chart) which is the chart reference. The
+        // a:chart element appears inside <p:graphicEl> in the timing tree only.
+        return ctn.Descendants<Drawing.Chart>().Any(c =>
+        {
+            var stepEnum = c.BuildStep?.Value;
+            return stepEnum != null && ((IEnumValue)stepEnum).Value == "gridLegend";
+        });
     }
 
     /// <summary>
@@ -1863,6 +2048,62 @@ public partial class PowerPointHandler
     /// </summary>
     private static void PopulateAnimationNode(DocumentNode animNode, CommonTimeNode effectCTn)
     {
+        // L3 sub-B: motion-path effects are stored under presetClass="motion"
+        // (a raw attribute the SDK doesn't model), with a child p:animMotion.
+        // Surface as class=motion + path=<preset|"custom"> + d=<raw path> so
+        // round-trip through Set/Get/Remove uses the same path= vocabulary as
+        // AddMotionAnimation. CONSISTENCY(animation-motion-presets).
+        var rawClsAttr = effectCTn.GetAttributes()
+            .FirstOrDefault(a => a.LocalName == "presetClass").Value;
+        if (rawClsAttr == "motion")
+        {
+            var animMotion = effectCTn.Descendants<AnimateMotion>().FirstOrDefault();
+            var pathStr = animMotion?.Path?.Value ?? "";
+            animNode.Format["class"] = "motion";
+            animNode.Format["effect"] = "motion";
+            var (preset, dir) = ResolveMotionPreset(pathStr);
+            if (preset != null)
+            {
+                animNode.Format["path"] = preset;
+                if (dir != null) animNode.Format["direction"] = dir;
+            }
+            else
+            {
+                animNode.Format["path"] = "custom";
+                animNode.Format["d"] = pathStr;
+            }
+            animNode.Format["motionPath"] = pathStr;
+            // Duration / trigger / delay / easing all stored on the same nodes
+            // as preset effects — fall through to the regular extraction below.
+            // Re-use the unified Read path by setting marker locals.
+            var motionDur = 500;
+            if (int.TryParse(animMotion?.CommonBehavior?.CommonTimeNode?.Duration, out var mdur)) motionDur = mdur;
+            else if (int.TryParse(effectCTn.Duration, out var mdur2)) motionDur = mdur2;
+            animNode.Format["duration"] = motionDur;
+            var ntm = effectCTn.NodeType?.Value;
+            animNode.Format["trigger"] = ntm == TimeNodeValues.AfterEffect ? "afterPrevious"
+                : ntm == TimeNodeValues.WithEffect ? "withPrevious"
+                : "onClick";
+            if (effectCTn.Acceleration?.HasValue == true && effectCTn.Acceleration.Value > 0)
+                animNode.Format["easein"] = (int)(effectCTn.Acceleration.Value / 1000);
+            if (effectCTn.Deceleration?.HasValue == true && effectCTn.Deceleration.Value > 0)
+                animNode.Format["easeout"] = (int)(effectCTn.Deceleration.Value / 1000);
+            // Walk up for delay (mid cTn pattern).
+            CommonTimeNode? midM = null;
+            var curM = effectCTn.Parent;
+            for (int wd = 0; wd < 5 && curM != null; wd++)
+            {
+                if (curM is CommonTimeNode cand && cand != effectCTn && cand.PresetId == null)
+                { midM = cand; break; }
+                curM = curM.Parent;
+            }
+            var dlyValM = midM?.StartConditionList?.GetFirstChild<Condition>()?.Delay?.Value;
+            if (dlyValM != null && dlyValM != "0"
+                && int.TryParse(dlyValM, out var dMsM) && dMsM > 0)
+                animNode.Format["delay"] = dMsM;
+            return;
+        }
+
         var presetId = effectCTn.PresetId?.Value ?? 0;
         var clsVal = effectCTn.PresetClass?.Value;
         var cls = clsVal == TimeNodePresetClassValues.Exit ? "exit"
@@ -1879,6 +2120,21 @@ public partial class PowerPointHandler
         animNode.Format["effect"] = effectName;
         animNode.Format["class"] = cls;
         animNode.Format["presetId"] = presetId;
+
+        // CONSISTENCY(anim-direction-readback): mirror the slide-level shape Get
+        // direction decode in Animations.cs (`Read direction from presetSubtype`).
+        // Without this key, dump emit cannot round-trip directional effects
+        // (fly-down → fly-up on replay, since AddAnimation defaults direction).
+        var presetSubtype = effectCTn.PresetSubtype?.Value ?? 0;
+        var dirStr = presetSubtype switch
+        {
+            8 => "left",
+            2 => "right",
+            1 when effectName is "fly" or "wipe" or "crawl" => "up",
+            4 when effectName is "fly" or "wipe" or "crawl" => "down",
+            _ => (string?)null
+        };
+        if (dirStr != null) animNode.Format["direction"] = dirStr;
 
         // bt-2 fix: surface trigger (encoded as effectCTn.NodeType in OOXML).
         // ClickEffect → onclick, AfterEffect → afterPrevious, WithEffect → withPrevious.
@@ -1899,6 +2155,32 @@ public partial class PowerPointHandler
             animNode.Format["easein"] = (int)(effectCTn.Acceleration.Value / 1000);
         if (effectCTn.Deceleration?.HasValue == true && effectCTn.Deceleration.Value > 0)
             animNode.Format["easeout"] = (int)(effectCTn.Deceleration.Value / 1000);
+
+        // L2 props: emit only when the underlying cTn attribute is present.
+        // OOXML repeatCount is 1000ths-of-a-count or the literal "indefinite";
+        // canonical readback is the plain integer count or "indefinite".
+        var rcRaw = effectCTn.RepeatCount?.Value;
+        if (!string.IsNullOrEmpty(rcRaw))
+        {
+            if (rcRaw.Equals("indefinite", StringComparison.OrdinalIgnoreCase))
+                animNode.Format["repeat"] = "indefinite";
+            else if (int.TryParse(rcRaw, System.Globalization.NumberStyles.Integer,
+                         System.Globalization.CultureInfo.InvariantCulture, out var rcMilli)
+                     && rcMilli >= 1000)
+                animNode.Format["repeat"] = rcMilli / 1000;
+        }
+        var restartVal = effectCTn.Restart?.Value;
+        if (restartVal != null)
+        {
+            // Round-trip canonical enum spelling rather than the SDK ToString().
+            string? canon = null;
+            if (restartVal == TimeNodeRestartValues.Always) canon = "always";
+            else if (restartVal == TimeNodeRestartValues.WhenNotActive) canon = "whenNotActive";
+            else if (restartVal == TimeNodeRestartValues.Never) canon = "never";
+            if (canon != null) animNode.Format["restart"] = canon;
+        }
+        if (effectCTn.AutoReverse?.Value == true)
+            animNode.Format["autoReverse"] = true;
 
         // Delay (stored on midCTn start condition)
         CommonTimeNode? midCTn = null;

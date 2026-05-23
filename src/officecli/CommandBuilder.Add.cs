@@ -13,7 +13,10 @@ static partial class CommandBuilder
     private static Command BuildAddCommand(Option<bool> jsonOption)
     {
         var addFileArg = new Argument<FileInfo>("file") { Description = "Office document path (required even with open/close mode)" };
-        var addParentPathArg = new Argument<string>("parent") { Description = "Parent DOM path (e.g. /body, /Sheet1, /slide[1])" };
+        var addParentPathArg = new Argument<string>("parent")
+        {
+            Description = "Parent DOM path. Conventions per handler: docx uses /body (or /body/p[N] for nested adds); xlsx uses /Sheet1 (or any sheet name); pptx slide uses '/' (slides hang off the presentation root), pptx shape uses /slide[N]. Wrap paths containing brackets in single quotes for zsh: '/slide[1]'."
+        };
         var addTypeOpt = new Option<string>("--type") { Description = "Element type to add (e.g. paragraph, run, table, sheet, row, cell, slide, shape, picture, ole, video)" };
         var addFromOpt = new Option<string?>("--from") { Description = "Copy from an existing element path (e.g. /slide[1]/shape[2])" };
         var addIndexOpt = new Option<int?>("--index")
@@ -232,6 +235,22 @@ static partial class CommandBuilder
                         Code = "unsupported_property",
                         Suggestion = suggestion,
                     });
+                }
+
+                // Advisory warnings from the Word handler (e.g. unknown styleId
+                // referenced as-is, unresolved styleName with spaces skipped).
+                if (handler is OfficeCli.Handlers.WordHandler addWhWarn
+                    && addWhWarn.LastAddWarnings.Count > 0)
+                {
+                    foreach (var w in addWhWarn.LastAddWarnings)
+                    {
+                        addWarnings.Add(new OfficeCli.Core.CliWarning
+                        {
+                            Message = w,
+                            Code = "advisory",
+                        });
+                    }
+                    hadWarnings = true;
                 }
 
                 if (json)

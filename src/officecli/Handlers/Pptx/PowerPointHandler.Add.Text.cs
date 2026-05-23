@@ -218,11 +218,19 @@ public partial class PowerPointHandler
                 if (properties.TryGetValue("align", out var pAlign))
                     pProps.Alignment = ParseTextAlignment(pAlign);
                 if (properties.TryGetValue("indent", out var pIndent))
-                    pProps.Indent = (int)ParseEmu(pIndent);
+                {
+                    // CONSISTENCY(pptx-bare-as-points): paragraph-level
+                    // length inputs treat bare numbers as points (see
+                    // spaceBefore/spaceAfter via SpacingConverter.ParsePptSpacing).
+                    // ParseEmu("1") would return 1 raw EMU ≈ 0mm, useless.
+                    // Bare "1" → 1pt → 12700 EMU; unit-qualified inputs
+                    // ("0.5cm", "12pt") still go through ParseEmu.
+                    pProps.Indent = (int)Math.Round(SpacingConverter.ParsePointsSigned(pIndent) * 12700.0);
+                }
                 if (properties.TryGetValue("marginLeft", out var pMarL) || properties.TryGetValue("marl", out pMarL))
-                    pProps.LeftMargin = (int)ParseEmu(pMarL);
+                    pProps.LeftMargin = (int)Math.Round(SpacingConverter.ParsePointsSigned(pMarL) * 12700.0);
                 if (properties.TryGetValue("marginRight", out var pMarR) || properties.TryGetValue("marr", out pMarR))
-                    pProps.RightMargin = (int)ParseEmu(pMarR);
+                    pProps.RightMargin = (int)Math.Round(SpacingConverter.ParsePointsSigned(pMarR) * 12700.0);
                 if (properties.TryGetValue("list", out var pList) || properties.TryGetValue("liststyle", out pList))
                     ApplyListStyle(pProps, pList);
                 if (properties.TryGetValue("level", out var pLevelStr))
@@ -327,10 +335,9 @@ public partial class PowerPointHandler
                 // inside a single <a:t> (paragraph-level only adds one paragraph
                 // here), but \t expands to <a:tab/> siblings between text runs
                 // so tabular text round-trips through PowerPoint.
-                var paraTextResolved = OfficeCli.Core.TextEscape.Resolve(paraText);
-                if (paraTextResolved.Contains('\t'))
+                if (paraText.Contains('\t'))
                 {
-                    AppendLineWithTabs(newPara, paraTextResolved, seg => new Drawing.Run
+                    AppendLineWithTabs(newPara, paraText, seg => new Drawing.Run
                     {
                         RunProperties = (Drawing.RunProperties)rProps.CloneNode(true),
                         Text = new Drawing.Text { Text = seg }
@@ -339,7 +346,7 @@ public partial class PowerPointHandler
                 else
                 {
                     newRun.RunProperties = rProps;
-                    newRun.Text = new Drawing.Text { Text = paraTextResolved };
+                    newRun.Text = new Drawing.Text { Text = paraText };
                     newPara.Append(newRun);
                 }
 
@@ -361,6 +368,81 @@ public partial class PowerPointHandler
                 return $"/slide[{paraSlideIdx}]/{BuildElementPathSegment("shape", paraShape, paraShapeIdx)}/paragraph[{paraCount}]";
     }
 
+
+    /// <summary>
+    /// `add --type linebreak /slide[N]/shape[M]/paragraph[K]` (also /placeholder[X]) —
+    /// insert an &lt;a:br/&gt; element into the target paragraph. Mirrors AddRun's path
+    /// resolution shape so /paragraph[K] suffix and /placeholder[X] alias both work.
+    /// </summary>
+    private string AddLineBreak(string parentPath, int? index, Dictionary<string, string> properties)
+    {
+        var brParaMatch = Regex.Match(parentPath, @"^/slide\[(\d+)\]/shape\[(\d+)\](?:/(?:paragraph|p)\[(\d+)\])?$");
+        var brPhMatch = brParaMatch.Success ? null : Regex.Match(parentPath, @"^/slide\[(\d+)\]/placeholder\[(\w+)\](?:/(?:paragraph|p)\[(\d+)\])?$");
+        if (!brParaMatch.Success && (brPhMatch == null || !brPhMatch.Success))
+            throw new ArgumentException(
+                "Line breaks must be added to a shape/placeholder or paragraph: " +
+                "/slide[N]/shape[M], /slide[N]/placeholder[X], /slide[N]/shape[M]/paragraph[K], or /slide[N]/placeholder[X]/paragraph[K]");
+
+        Shape brShape;
+        System.Text.RegularExpressions.Group brParaGroup;
+        if (brParaMatch.Success)
+        {
+            var slideIdx = int.Parse(brParaMatch.Groups[1].Value);
+            var shapeIdx = int.Parse(brParaMatch.Groups[2].Value);
+            (_, brShape) = ResolveShape(slideIdx, shapeIdx);
+            brParaGroup = brParaMatch.Groups[3];
+        }
+        else
+        {
+            var slideIdx = int.Parse(brPhMatch!.Groups[1].Value);
+            var phToken = brPhMatch.Groups[2].Value;
+            var slideParts = GetSlideParts().ToList();
+            if (slideIdx < 1 || slideIdx > slideParts.Count)
+                throw new ArgumentException($"Slide {slideIdx} not found (total: {slideParts.Count})");
+            brShape = ResolvePlaceholderShape(slideParts[slideIdx - 1], phToken);
+            brParaGroup = brPhMatch.Groups[3];
+        }
+
+        var brTextBody = brShape.TextBody
+            ?? throw new InvalidOperationException("Shape has no text body");
+
+        Drawing.Paragraph targetPara;
+        int targetParaIdx;
+        var paras = brTextBody.Elements<Drawing.Paragraph>().ToList();
+        if (brParaGroup.Success)
+        {
+            targetParaIdx = int.Parse(brParaGroup.Value);
+            if (targetParaIdx < 1 || targetParaIdx > paras.Count)
+                throw new ArgumentException($"Paragraph {targetParaIdx} not found");
+            targetPara = paras[targetParaIdx - 1];
+        }
+        else
+        {
+            targetPara = paras.LastOrDefault()
+                ?? throw new InvalidOperationException("Shape has no paragraphs");
+            targetParaIdx = paras.Count;
+        }
+
+        var br = new Drawing.Break();
+        if (index.HasValue)
+        {
+            var children = targetPara.ChildElements.ToList();
+            var insertAt = Math.Max(0, Math.Min(index.Value, children.Count));
+            if (insertAt >= children.Count) targetPara.AppendChild(br);
+            else children[insertAt].InsertBeforeSelf(br);
+        }
+        else
+        {
+            targetPara.AppendChild(br);
+        }
+
+        var brIdx = targetPara.Elements<Drawing.Break>().ToList().FindIndex(b => ReferenceEquals(b, br)) + 1;
+        return $"/slide[{(brParaMatch.Success ? brParaMatch.Groups[1].Value : brPhMatch!.Groups[1].Value)}]" +
+               (brParaMatch.Success
+                    ? $"/shape[{brParaMatch.Groups[2].Value}]"
+                    : $"/placeholder[{brPhMatch!.Groups[2].Value}]") +
+               $"/paragraph[{targetParaIdx}]/br[{brIdx}]";
+    }
 
     private string AddRun(string parentPath, int? index, Dictionary<string, string> properties)
     {
@@ -458,6 +540,37 @@ public partial class PowerPointHandler
                         "false" or "none" => Drawing.TextStrikeValues.NoStrike,
                         _ => throw new ArgumentException($"Invalid strikethrough value: '{rStrike}'. Valid values: single, double, none.")
                     };
+                // cap on run rPr (a:rPr/@cap). Schema declares add:true; symmetric
+                // with the run-context Set branch in ShapeProperties.cs. Aliases
+                // allCaps / smallCaps mirror Set's normalization — boolean-truthy
+                // → all/small respectively; explicit "none"/"false" clears.
+                string? rCapKey =
+                    properties.ContainsKey("cap") ? "cap" :
+                    properties.Keys.FirstOrDefault(k =>
+                        k.Equals("allCaps", StringComparison.OrdinalIgnoreCase)
+                        || k.Equals("allcaps", StringComparison.OrdinalIgnoreCase)
+                        || k.Equals("smallCaps", StringComparison.OrdinalIgnoreCase)
+                        || k.Equals("smallcaps", StringComparison.OrdinalIgnoreCase));
+                if (rCapKey != null)
+                {
+                    var rCapRaw = properties[rCapKey];
+                    string capNorm;
+                    if (rCapKey.Equals("cap", StringComparison.Ordinal))
+                        capNorm = rCapRaw.ToLowerInvariant();
+                    else if (rCapKey.StartsWith("allCaps", StringComparison.OrdinalIgnoreCase)
+                          || rCapKey.StartsWith("allcaps", StringComparison.OrdinalIgnoreCase))
+                        capNorm = (rCapRaw is "0" or "false" or "False" or "none") ? "none" : "all";
+                    else
+                        capNorm = (rCapRaw is "0" or "false" or "False" or "none") ? "none" : "small";
+
+                    rProps.Capital = capNorm switch
+                    {
+                        "all" => Drawing.TextCapsValues.All,
+                        "small" => Drawing.TextCapsValues.Small,
+                        "none" => Drawing.TextCapsValues.None,
+                        _ => throw new ArgumentException($"Invalid cap value: '{rCapRaw}'. Valid values: none, small, all.")
+                    };
+                }
                 // Schema order: solidFill before latin/ea
                 if (properties.TryGetValue("color", out var rColor))
                     rProps.AppendChild(BuildSolidFill(rColor));
@@ -516,6 +629,31 @@ public partial class PowerPointHandler
                 else if (properties.TryGetValue("subscript", out var rSub))
                     rProps.Baseline = IsTruthy(rSub) ? -25000 : 0;
 
+                // CONSISTENCY(addrun-rpr-attrs): AddShape routes these through
+                // SetRunOrShapeProperties / effectKeys but AddRun has its own
+                // narrower property loop. Mirror the bool/int attribute set
+                // here so `--type run` round-trips the same OOXML rPr surface
+                // (matches DrawingRunBoolAttrs / DrawingRunIntAttrs in
+                // PowerPointHandler.ShapeProperties.cs).
+                foreach (var (boolKey, attrName) in new[] {
+                    ("noProof", "noProof"), ("dirty", "dirty"),
+                    ("err", "err"), ("smtClean", "smtClean") })
+                {
+                    if (properties.TryGetValue(boolKey, out var bv))
+                        rProps.SetAttribute(new DocumentFormat.OpenXml.OpenXmlAttribute(
+                            "", attrName, "", IsTruthy(bv) ? "1" : "0"));
+                }
+                if (properties.TryGetValue("smtId", out var smtIdRaw))
+                {
+                    // ST_UnsignedInt-ish — accept any integer string; let
+                    // ParseHelpers normalize (matches the Set int-attr path).
+                    var smtIdVal = OfficeCli.Core.ParseHelpers.SafeParseInt(smtIdRaw, "smtId");
+                    if (smtIdVal < 0)
+                        throw new ArgumentException($"Invalid smtId '{smtIdRaw}' (must be non-negative).");
+                    rProps.SetAttribute(new DocumentFormat.OpenXml.OpenXmlAttribute(
+                        "", "smtId", "", smtIdVal.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+                }
+
                 newRun.RunProperties = rProps;
                 // Hyperlink on the new run. Schema declares link.add=true with
                 // parent "shape|run" — without this branch the shape-level Add
@@ -530,7 +668,7 @@ public partial class PowerPointHandler
                 // tabs land as raw chars inside <a:t> rather than <a:tab/>;
                 // higher-level shape-text Add/Set splits on \t into separate
                 // runs with <a:tab/> siblings.
-                newRun.Text = new Drawing.Text { Text = OfficeCli.Core.TextEscape.Resolve(runText) };
+                newRun.Text = new Drawing.Text { Text = runText };
 
                 // Insert run at specified index, or append
                 if (index.HasValue)
@@ -562,23 +700,30 @@ public partial class PowerPointHandler
     }
 
     // CONSISTENCY(escape-sequences): cross-handler convention — \t in paragraph
-    // text becomes an <a:tab/> element placed as a paragraph child between
-    // text-bearing <a:r> runs (the SDK has no strongly-typed class for it,
-    // so we emit OpenXmlUnknownElement). Caller has already split on real
-    // '\n' chars; this helper handles real '\t' chars within a single line.
-    // `runFactory` builds an <a:r> for a literal text segment; the helper
-    // appends runs and tabs to `paragraph` in left-to-right order.
+    // text becomes a literal U+0009 inside an <a:r><a:t> run, matching what
+    // PowerPoint itself writes. An earlier implementation emitted an
+    // <a:tab/> sibling via OpenXmlUnknownElement, but CT_TextParagraph in
+    // the DrawingML schema does not allow <a:tab/> as a direct child of
+    // <a:p> — the SDK validator and `view issues` both flagged the file.
+    // Caller has already split on real '\n' chars; this helper handles real
+    // '\t' chars within a single line by joining segments with a tab character
+    // and emitting a single run per segment.
     internal static void AppendLineWithTabs(
         Drawing.Paragraph paragraph,
         string line,
         Func<string, Drawing.Run> runFactory)
     {
-        const string aNs = "http://schemas.openxmlformats.org/drawingml/2006/main";
         var segments = line.Split('\t');
         for (int i = 0; i < segments.Length; i++)
         {
             if (i > 0)
-                paragraph.AppendChild(new OpenXmlUnknownElement("a", "tab", aNs));
+            {
+                // Emit the tab as its own run so the surrounding segment runs
+                // keep their independent rPr (formatting on either side of the
+                // tab is preserved). PowerPoint accepts a literal U+0009 inside
+                // <a:t> and renders it as a tab.
+                paragraph.AppendChild(runFactory("\t"));
+            }
             // Always emit a run per segment (including empty) so run formatting
             // is preserved on both sides of the tab. PowerPoint tolerates empty
             // <a:r><a:t/></a:r>.

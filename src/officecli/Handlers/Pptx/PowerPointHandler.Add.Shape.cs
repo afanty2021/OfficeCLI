@@ -12,7 +12,8 @@ namespace OfficeCli.Handlers;
 
 public partial class PowerPointHandler
 {
-    private string AddShape(string parentPath, int? index, Dictionary<string, string> properties)
+    private string AddShape(string parentPath, int? index, Dictionary<string, string> properties,
+                            string? elementTypeHint = null)
     {
                 // CONSISTENCY(master-layout-shape-edit): a shape parent may be a
                 // slide (/slide[N]) or a master/layout part. Master/layout shapes
@@ -111,7 +112,28 @@ public partial class PowerPointHandler
                         shapeName = "!!" + shapeName;
                 }
 
-                var newShape = CreateTextShape(shapeId, shapeName, text, false);
+                // Classify: explicit `--type textbox` always produces a textbox
+                // (writes <p:cNvSpPr txBox="1"/>). For `--type shape` (and the
+                // legacy default where the dispatch doesn't pass a hint), fall
+                // back to a heuristic: explicit geometry (shape=/preset=/
+                // geometry=/customGeometryXml=) → real shape; bare `text=` →
+                // textbox shorthand; otherwise → real shape (matches the
+                // `--type shape` direct intuition).
+                var hasGeometryProp = properties.ContainsKey("shape")
+                    || properties.ContainsKey("preset")
+                    || properties.ContainsKey("geometry")
+                    || properties.ContainsKey("customGeometryXml");
+                var hasTextProp = properties.ContainsKey("text");
+                // `--type textbox` is the explicit textbox path and always
+                // wins (covers the dump-emitter replay case where text is
+                // split into separate paragraph/run adds, so hasTextProp here
+                // is false). `--type shape` keeps the legacy "text= shorthand"
+                // — bare text with no geometry is still classified as
+                // textbox, since users (and earlier tests) treat that as the
+                // textbox shortcut.
+                bool isTextBoxFlavor = elementTypeHint == "textbox"
+                    || (!hasGeometryProp && hasTextProp);
+                var newShape = CreateTextShape(shapeId, shapeName, text, false, isTextBoxFlavor);
 
                 // CONSISTENCY(font-dotted-alias): mirror Set's font.<attr> aliases
                 // (commit 80fb739e). Without these, `add shape --prop font.name=Arial`
@@ -306,6 +328,27 @@ public partial class PowerPointHandler
                             "false" or "none" => Drawing.TextUnderlineValues.None,
                             _ => throw new ArgumentException($"Invalid underline value: '{ulVal}'. Valid values: single, double, heavy, dotted, dash, wavy, none.")
                         };
+                    }
+                }
+
+                // Underline color — mirrors Set ShapeProperties.cs:436. Writes
+                // <a:uFill><a:solidFill><a:srgbClr val="…"/></a:solidFill></a:uFill>
+                // on every run; ReorderDrawingRunProperties keeps the schema
+                // order (uLn before uFill before latin).
+                if (properties.TryGetValue("underline.color", out var ulColorVal)
+                    || properties.TryGetValue("underlineColor", out ulColorVal)
+                    || properties.TryGetValue("underlinecolor", out ulColorVal)
+                    || properties.TryGetValue("font.underline.color", out ulColorVal))
+                {
+                    var ulHex = OfficeCli.Core.ParseHelpers.SanitizeColorForOoxml(ulColorVal).Rgb;
+                    foreach (var run in newShape.Descendants<Drawing.Run>())
+                    {
+                        var rProps = run.RunProperties ?? (run.RunProperties = new Drawing.RunProperties());
+                        rProps.RemoveAllChildren<Drawing.UnderlineFill>();
+                        rProps.RemoveAllChildren<Drawing.UnderlineFillText>();
+                        rProps.AppendChild(new Drawing.UnderlineFill(
+                            new Drawing.SolidFill(new Drawing.RgbColorModelHex { Val = ulHex })));
+                        ReorderDrawingRunProperties(rProps);
                     }
                 }
 
@@ -609,33 +652,15 @@ public partial class PowerPointHandler
                     properties["lineDash"] = compoundLineDash;
                 }
 
-                // Default visibility outline: when caller picks a geometry via
-                // shape=/preset=/geometry= and specifies no fill AND no line,
-                // PowerPoint's "Insert Shape" UI gives a thin dark outline so the geometry
-                // is visible. Without it, presets like ellipse/rect render as invisible
-                // (no stroke + no fill) — confirmed in real PowerPoint and HTML/SVG previews.
-                // Skip when the caller did NOT pick a geometry (we default to rect for
-                // text-only shapes; those are textbox-flavored and should stay borderless,
-                // matching PowerPoint's Insert Text Box UI).
-                var callerPickedGeometry = properties.ContainsKey("preset")
-                    || properties.ContainsKey("geometry")
-                    || properties.ContainsKey("shape");
-                if (callerPickedGeometry
-                    && newShape.ShapeProperties != null
-                    && newShape.ShapeProperties.GetFirstChild<Drawing.Outline>() == null
-                    && newShape.ShapeProperties.GetFirstChild<Drawing.SolidFill>() == null
-                    && newShape.ShapeProperties.GetFirstChild<Drawing.GradientFill>() == null
-                    && newShape.ShapeProperties.GetFirstChild<Drawing.PatternFill>() == null
-                    && newShape.ShapeProperties.GetFirstChild<Drawing.BlipFill>() == null
-                    && newShape.ShapeProperties.GetFirstChild<Drawing.NoFill>() == null
-                    && newShape.ShapeProperties.GetFirstChild<Drawing.PresetGeometry>() != null)
-                {
-                    // 0.75pt = 9525 EMU (1pt = 12700 EMU). #595959 matches PowerPoint UI default.
-                    var defaultOutline = new Drawing.Outline { Width = 9525 };
-                    defaultOutline.AppendChild(new Drawing.SolidFill(
-                        new Drawing.RgbColorModelHex { Val = "595959" }));
-                    newShape.ShapeProperties.AppendChild(defaultOutline);
-                }
+                // Outline policy: "user didn't ask = we don't write". Earlier the
+                // handler auto-injected a 0.75pt #595959 outline whenever the caller
+                // picked a geometry and gave no fill+line, mimicking PowerPoint's
+                // "Insert Shape" UI default. That phantom border survived through
+                // dump→replay: NodeBuilder reported lineColor=595959, the batch
+                // emitter forwarded it, and every round-trip grew a darker border on
+                // a shape the user never asked to outline. The visibility regression
+                // (presets render with no stroke) is the lesser harm; defer the
+                // default-outline UX to a caller-driven `line=default`/UI layer.
 
                 // List style (bullet/numbered)
                 if (properties.TryGetValue("list", out var listVal) || properties.TryGetValue("liststyle", out listVal))
@@ -683,6 +708,7 @@ public partial class PowerPointHandler
                       "baseline", "superscript", "subscript",
                       "textwarp", "wordart", "autofit",
                       "lineopacity", "line.opacity",
+                      "linegradient", "line.gradient",
                       // previously dropped silently — route through Set
                       // so OOXML attributes actually get emitted.
                       "linecap", "lineCap", "line.cap",

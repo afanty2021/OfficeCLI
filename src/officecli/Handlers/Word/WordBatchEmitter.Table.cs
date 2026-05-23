@@ -222,13 +222,36 @@ public static partial class WordBatchEmitter
                 int cellParaIdx = 0;
                 int nestedTblIdx = 0;
                 bool firstParaSeen = false;
-                foreach (var cc in cellChildren)
+
+                // BUG-DUMP-NESTED-TBL-TRAILING: OOXML requires every cell to
+                // end with a paragraph (not a table). When a cell would
+                // otherwise end with a table, the SDK auto-inserts a trailing
+                // paragraph on save — so the cell's LAST paragraph following
+                // a nested table is structurally auto-present on the target
+                // side too, regardless of whether source's iteration already
+                // used its autoPresent slot on a leading paragraph. Without
+                // this, source [table, p] dumps `set p[last()]`
+                // (autoPresent=true) but target [auto-p, table, p] re-dumps
+                // `set p[1]` + `add p` and diverges by one row.
+                int trailingAutoP = -1;
+                for (int k = cellChildren.Count - 1; k >= 0; k--)
                 {
+                    var ct = cellChildren[k].Type;
+                    if (ct != "paragraph" && ct != "p") continue;
+                    if (k > 0 && cellChildren[k - 1].Type == "table")
+                        trailingAutoP = k;
+                    break;
+                }
+
+                for (int k = 0; k < cellChildren.Count; k++)
+                {
+                    var cc = cellChildren[k];
                     if (cc.Type == "paragraph" || cc.Type == "p")
                     {
                         cellParaIdx++;
+                        bool isTrailingAutoP = k == trailingAutoP;
                         EmitParagraph(word, cc.Path, cellTargetPath, cellParaIdx, items,
-                                      autoPresent: !firstParaSeen, ctx);
+                                      autoPresent: !firstParaSeen || isTrailingAutoP, ctx);
                         firstParaSeen = true;
                     }
                     else if (cc.Type == "table")

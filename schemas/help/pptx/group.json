@@ -33,8 +33,10 @@
     },
     "zorder": {
       "type": "number",
-      "description": "1-based z-order in slide shape tree.",
-      "add": false, "set": false, "get": false,
+      "description": "1-based z-order in slide shape tree. On add, positions the group within the shape tree (1 = back). Post-creation reordering is not supported via Set; use Move/Swap on the group, or raw-set the spTree child order.",
+      "aliases": ["z-order", "order"],
+      "add": true, "set": false, "get": true,
+      "examples": ["--prop zorder=1"],
       "readback": "1-based integer (1 = back)",
       "enforcement": "report"
     },

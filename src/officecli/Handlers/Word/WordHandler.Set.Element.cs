@@ -969,6 +969,15 @@ public partial class WordHandler
             }
             else switch (k)
             {
+                case "tabs" or "tabstops":
+                {
+                    // `tabs=POS:ALIGN[:LEADER],...` shorthand. Replaces the
+                    // entire <w:tabs> strip — see ApplyTabsShorthand in
+                    // Helpers.cs for the syntax. CONSISTENCY(add-set-symmetry).
+                    var paraPpr = para.ParagraphProperties ?? para.PrependChild(new ParagraphProperties());
+                    ApplyTabsShorthand(paraPpr, value);
+                    break;
+                }
                 case "formula":
                 {
                     // Replace paragraph content with OMML equation in-place
@@ -1061,6 +1070,7 @@ public partial class WordHandler
                     break;
                 }
                 case "size" or "font" or "bold" or "italic" or "color" or "highlight" or "underline" or "strike"
+                  or "underline.color" or "underlinecolor" or "underlineColor" or "font.underline.color"
                   or "font.latin" or "font.ascii" or "font.hansi" or "font.hAnsi"
                   or "font.ea" or "font.eastasia" or "font.eastasian"
                   or "font.cs" or "font.complexscript" or "font.complex"
@@ -1282,6 +1292,12 @@ public partial class WordHandler
         {
             switch (key.ToLowerInvariant())
             {
+                case "skipgridsync":
+                    // CONSISTENCY(tblgrid-preserve): consumed inline by the
+                    // width branch as a side-effect modifier. Recognized
+                    // here so dump→batch replay doesn't flag the emitter-
+                    // injected skipGridSync=true as UNSUPPORTED.
+                    break;
                 case "text":
                     // Defer text handling until after formatting is applied
                     deferredText = value;
@@ -1293,6 +1309,9 @@ public partial class WordHandler
                 case "color":
                 case "highlight":
                 case "underline":
+                case "underline.color":
+                case "underlinecolor":
+                case "underlineColor":
                 case "strike":
                     // Apply to all runs in all paragraphs in the cell
                     // CONSISTENCY(run-prop-helper): per-prop OOXML write
@@ -1617,12 +1636,20 @@ public partial class WordHandler
                     break;
                 }
                 case "vmerge":
+                {
                     // ST_Merge schema only defines "restart" — continuation is bare <w:vMerge/>.
-                    // BUG-R5-table-merge BUG-9: continuation vMerge in the
-                    // first row has no restart anchor above it — Word renders
-                    // the cell as invisible / repairs the file. Reject up
-                    // front; users must set vmerge=restart instead.
-                    if (value.ToLowerInvariant() != "restart"
+                    // Removal values (none / clear / remove / false / "") strip
+                    // the element entirely so the cell stands alone.
+                    var vmLower = value.ToLowerInvariant();
+                    bool isRestart = vmLower == "restart";
+                    bool isContinue = vmLower == "continue";
+                    bool isRemove = vmLower is "none" or "clear" or "remove" or "false" or "0" or "no" or "off" or "";
+
+                    // BUG-R5-table-merge BUG-9: continuation vMerge in the first
+                    // row has no restart anchor above it — Word renders the cell
+                    // as invisible / repairs the file. Only reject the explicit
+                    // continuation case; removal and restart are always safe.
+                    if (isContinue
                         && cell.Parent is TableRow vmRow0
                         && vmRow0.Parent is Table vmTbl0
                         && vmTbl0.Elements<TableRow>().FirstOrDefault() == vmRow0)
@@ -1630,10 +1657,15 @@ public partial class WordHandler
                         throw new ArgumentException(
                             "Cannot set vmerge=continue on a cell in the first row: there is no restart anchor above it. Use vmerge=restart instead.");
                     }
-                    tcPr.VerticalMerge = value.ToLowerInvariant() == "restart"
-                        ? new VerticalMerge { Val = MergedCellValues.Restart }
-                        : new VerticalMerge();
+
+                    if (isRemove)
+                        tcPr.VerticalMerge = null;
+                    else if (isRestart)
+                        tcPr.VerticalMerge = new VerticalMerge { Val = MergedCellValues.Restart };
+                    else // continue (bare <w:vMerge/>)
+                        tcPr.VerticalMerge = new VerticalMerge();
                     break;
+                }
                 case "hmerge":
                     // BUG-R1-P1-8: <w:hMerge> is a legacy DOC binary-compat
                     // attribute that Word *ignores* in DOCX. The OOXML way to

@@ -25,10 +25,35 @@ public partial class WordHandler
         if (properties.TryGetValue("style", out var style)
             || properties.TryGetValue("styleId", out style)
             || properties.TryGetValue("styleid", out style))
+        {
+            // CONSISTENCY(style-warn): mirror SetParagraph (Set.cs:642) —
+            // warn (advisory, non-fatal) when the style id is not defined
+            // in the styles part; still store the ref (lenient-input).
+            if (!StyleIdExists(style))
+                LastAddWarnings.Add($"style '{style}' not found in styles part — will be referenced as-is");
             pProps.ParagraphStyleId = new ParagraphStyleId { Val = style };
+        }
         else if (properties.TryGetValue("styleName", out var styleName)
             || properties.TryGetValue("stylename", out styleName))
-            pProps.ParagraphStyleId = new ParagraphStyleId { Val = ResolveStyleIdFromName(styleName) ?? styleName };
+        {
+            // Resolve display name through styles part. Fall back to verbatim
+            // only when the value is a plausible styleId (no spaces — OOXML
+            // styleId disallows spaces). Spaced display names that fail to
+            // resolve are skipped + warned rather than stored as invalid id.
+            var resolved = ResolveStyleIdFromName(styleName);
+            if (resolved != null)
+            {
+                pProps.ParagraphStyleId = new ParagraphStyleId { Val = resolved };
+            }
+            else if (!styleName.Contains(' '))
+            {
+                pProps.ParagraphStyleId = new ParagraphStyleId { Val = styleName };
+            }
+            else
+            {
+                LastAddWarnings.Add($"styleName '{styleName}' not found in styles part and contains spaces — skipped (OOXML styleId disallows spaces)");
+            }
+        }
         if (properties.TryGetValue("align", out var alignment) || properties.TryGetValue("alignment", out alignment))
             pProps.Justification = new Justification { Val = ParseJustification(alignment) };
         // Reading direction (Arabic / Hebrew). 'rtl' enables <w:bidi/> AND
@@ -294,7 +319,11 @@ public partial class WordHandler
             var numPr = pProps.NumberingProperties ?? (pProps.NumberingProperties = new NumberingProperties());
             numPr.NumberingLevelReference = new NumberingLevelReference { Val = ilvlVal };
         }
-        if (properties.TryGetValue("shd", out var pShdVal) || properties.TryGetValue("shading", out pShdVal))
+        if (properties.TryGetValue("tabs", out var pTabsVal) || properties.TryGetValue("tabstops", out pTabsVal))
+        {
+            ApplyTabsShorthand(pProps, pTabsVal);
+        }
+        if (properties.TryGetValue("shd", out var pShdVal) || properties.TryGetValue("shading", out pShdVal) || properties.TryGetValue("fill", out pShdVal))
         {
             var shdParts = pShdVal.Split(';');
             var shd = new Shading();
@@ -801,8 +830,7 @@ public partial class WordHandler
             // command on dump replay.
 
             run.AppendChild(rProps);
-            AppendTextWithBreaks(run, text);
-            para.AppendChild(run);
+            AppendTextWithPageFields(para, run, rProps, text);
         }
 
         // Dotted-key fallback: any "element.attr=value" prop the hand-rolled
@@ -1647,6 +1675,11 @@ public partial class WordHandler
             "trackchange",
             // BUG-DUMP7-01: consumed up-front to emit <w:sym/> in place of <w:t>.
             "sym",
+            // CONSISTENCY(markRPr-inherit-opt-out): consumed up-front (line ~1587)
+            // to suppress markRPr→rPr type-fill on dump→batch replay. Not a real
+            // OOXML attribute — pure inheritance toggle. Without this entry the
+            // bare-key fallback flags it UNSUPPORTED on every dump-emitted `add r`.
+            "nomarkrprinherit",
         };
         foreach (var (key, value) in properties)
         {
@@ -1896,6 +1929,54 @@ public partial class WordHandler
     /// round-trip through Word instead of being collapsed to a single space.
     /// CRLF/CR are normalized to LF first.
     /// </summary>
+    // Expand `{page}` / `{pages}` tokens in user-supplied paragraph text into
+    // proper PAGE / NUMPAGES complex-field runs (begin / instrText / separate /
+    // result / end). The pre-built `run` is reused for the first literal
+    // segment so its rPr stays intact; subsequent literal segments and the
+    // field-run sequences clone `rPropsTemplate` so formatting (font/size/
+    // color/...) survives the split. Without this Word renders the tokens
+    // verbatim instead of substituting page numbers.
+    private static readonly System.Text.RegularExpressions.Regex PageFieldTokenRegex =
+        new(@"\{(page|pages)\}", System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    internal static void AppendTextWithPageFields(Paragraph para, Run firstRun, RunProperties rPropsTemplate, string text)
+    {
+        if (string.IsNullOrEmpty(text) || !PageFieldTokenRegex.IsMatch(text))
+        {
+            AppendTextWithBreaks(firstRun, text);
+            para.AppendChild(firstRun);
+            return;
+        }
+
+        int cursor = 0;
+        bool firstRunUsed = false;
+        foreach (System.Text.RegularExpressions.Match m in PageFieldTokenRegex.Matches(text))
+        {
+            if (m.Index > cursor)
+            {
+                var segment = text.Substring(cursor, m.Index - cursor);
+                var segRun = firstRunUsed ? new Run((RunProperties)rPropsTemplate.CloneNode(true)) : firstRun;
+                AppendTextWithBreaks(segRun, segment);
+                para.AppendChild(segRun);
+                firstRunUsed = true;
+            }
+            var instr = m.Groups[1].Value.Equals("pages", StringComparison.OrdinalIgnoreCase) ? " NUMPAGES " : " PAGE ";
+            para.AppendChild(new Run((RunProperties)rPropsTemplate.CloneNode(true), new FieldChar { FieldCharType = FieldCharValues.Begin }));
+            para.AppendChild(new Run((RunProperties)rPropsTemplate.CloneNode(true), new FieldCode(instr) { Space = SpaceProcessingModeValues.Preserve }));
+            para.AppendChild(new Run((RunProperties)rPropsTemplate.CloneNode(true), new FieldChar { FieldCharType = FieldCharValues.Separate }));
+            para.AppendChild(new Run((RunProperties)rPropsTemplate.CloneNode(true), new Text("1") { Space = SpaceProcessingModeValues.Preserve }));
+            para.AppendChild(new Run((RunProperties)rPropsTemplate.CloneNode(true), new FieldChar { FieldCharType = FieldCharValues.End }));
+            firstRunUsed = true;
+            cursor = m.Index + m.Length;
+        }
+        if (cursor < text.Length)
+        {
+            var tailRun = firstRunUsed ? new Run((RunProperties)rPropsTemplate.CloneNode(true)) : firstRun;
+            AppendTextWithBreaks(tailRun, text.Substring(cursor));
+            para.AppendChild(tailRun);
+        }
+    }
+
     internal static void AppendTextWithBreaks(Run run, string text)
     {
         if (string.IsNullOrEmpty(text))
@@ -1912,8 +1993,9 @@ public partial class WordHandler
         // two-char escapes in --prop text= are interpreted as real newline /
         // tab. Mirrors PPTX shape-text and Excel cell-value handling. CRLF/CR
         // collapsed afterwards so all break forms route through <w:br/>.
-        var s = OfficeCli.Core.TextEscape.Resolve(text);
-        s = s.Replace("\r\n", "\n").Replace("\r", "\n");
+        // CONSISTENCY(text-escape-boundary): \n / \t resolution at CLI --prop;
+        // text arrives with real newlines already, just normalize CR / CRLF.
+        var s = text.Replace("\r\n", "\n").Replace("\r", "\n");
         int start = 0;
         for (int i = 0; i < s.Length; i++)
         {

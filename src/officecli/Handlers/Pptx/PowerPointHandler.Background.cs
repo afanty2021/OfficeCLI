@@ -447,6 +447,47 @@ public partial class PowerPointHandler
     private static void ReadSlideBackground(Slide slide, DocumentNode node)
         => ReadBackground(slide.CommonSlideData, node);
 
+    /// <summary>
+    /// Read per-slide header/footer visibility flags from <c>&lt;p:hf&gt;</c>.
+    /// Mirrors the Set surface in PowerPointHandler.Set.Slide.cs (showFooter /
+    /// showSlideNumber / showDate / showHeader). Only emits keys when the
+    /// attribute is explicitly present so absent/default flags don't pollute
+    /// the readback.
+    ///
+    /// CONSISTENCY(hf-unknown-element): the SDK's strongly-typed HeaderFooter
+    /// class is bound to HeaderFooterMaster contexts; the schema-as-published
+    /// doesn't list `&lt;p:hf&gt;` as a direct child of `&lt;p:sld&gt;`, so the SDK
+    /// parses our written hf back as `OpenXmlUnknownElement` instead of
+    /// HeaderFooter. (`GetFirstChild&lt;HeaderFooter&gt;()` returns null on
+    /// reload even though Set wrote the typed instance.) Read attributes
+    /// directly by local name to survive that round-trip.
+    /// </summary>
+    private static void ReadSlideHeaderFooter(Slide slide, DocumentNode node)
+    {
+        var hfEl = slide.ChildElements.FirstOrDefault(c => c.LocalName == "hf"
+            && c.NamespaceUri == "http://schemas.openxmlformats.org/presentationml/2006/main");
+        if (hfEl == null) return;
+        // Walk raw attributes — GetAttribute(name, ns) on a strongly-typed
+        // HeaderFooter throws when the attribute isn't in its declared schema
+        // (the typed surface bound the missing ones via .Footer/.Header/...).
+        // Iterating the live attribute collection works regardless of whether
+        // the element is OpenXmlUnknownElement (post-reload) or HeaderFooter
+        // (same-session, post-Set).
+        static string? Bool(string v) => string.IsNullOrEmpty(v) ? null : (v is "1" or "true" ? "true" : "false");
+        foreach (var attr in hfEl.GetAttributes())
+        {
+            var b = Bool(attr.Value ?? "");
+            if (b == null) continue;
+            switch (attr.LocalName)
+            {
+                case "ftr": node.Format["showFooter"] = b; break;
+                case "sldNum": node.Format["showSlideNumber"] = b; break;
+                case "dt": node.Format["showDate"] = b; break;
+                case "hdr": node.Format["showHeader"] = b; break;
+            }
+        }
+    }
+
     internal static void ReadBackground(CommonSlideData? cSld, DocumentNode node)
     {
         if (cSld?.Background == null) return;
@@ -596,6 +637,27 @@ public partial class PowerPointHandler
     /// </summary>
     private static string NormalizeGradientValue(string value)
     {
+        // CONSISTENCY(gradient-angle-separator): chart series gradients emit
+        // `C1-C2:ANGLE` (colon-separated angle) while shape gradients use the
+        // dash-separated `C1-C2-ANGLE` form. Users (and dump→batch replay)
+        // legitimately confuse the two — accept the colon form on shape input
+        // and normalize to the canonical dash form so the existing linear
+        // parser unwraps it. Get/dump still emit each surface's canonical
+        // separator unchanged (dash for shape, colon for chart) to preserve
+        // round-trip and schema expectations.
+        if (!value.StartsWith("radial:", StringComparison.OrdinalIgnoreCase)
+            && !value.StartsWith("path:", StringComparison.OrdinalIgnoreCase)
+            && !value.StartsWith("linear;", StringComparison.OrdinalIgnoreCase))
+        {
+            var colonIdx = value.LastIndexOf(':');
+            if (colonIdx > 0 && colonIdx < value.Length - 1)
+            {
+                var tail = value[(colonIdx + 1)..];
+                if (int.TryParse(tail, out var angleDeg) && angleDeg >= -360 && angleDeg <= 360)
+                    value = value[..colonIdx] + "-" + tail;
+            }
+        }
+
         // Detect semicolon-separated format: TYPE;C1;C2[;angle/focus]
         if (!value.Contains(';')) return value;
 

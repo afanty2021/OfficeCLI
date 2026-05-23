@@ -50,7 +50,7 @@ public partial class ExcelHandler
         }
 
         if (seriesData.Count == 0)
-            throw new ArgumentException("Chart requires data. Use: data=\"Series1:1,2,3;Series2:4,5,6\" " +
+            throw new ArgumentException("Chart requires a 'data' property. Use: data=\"Series1:1,2,3;Series2:4,5,6\" " +
                 "or dataRange=\"Sheet1!A1:D5\" or series1=\"Revenue:100,200,300\"");
 
         // Create DrawingsPart if needed
@@ -225,10 +225,16 @@ public partial class ExcelHandler
         chartPart.ChartSpace = chartSpace;
         chartPart.ChartSpace.Save();
 
-        // Apply deferred properties (axisTitle, dataLabels, etc.) via SetChartProperties
-        var deferredProps = properties
-            .Where(kv => ChartHelper.IsDeferredKey(kv.Key))
-            .ToDictionary(kv => kv.Key, kv => kv.Value);
+        // Apply deferred properties (axisTitle, dataLabels, etc.) via SetChartProperties.
+        // CONSISTENCY(tracking-deferred-filter): see PowerPointHandler.Add.Media.cs —
+        // .Where() over TrackingPropertyDictionary marks every key consumed and
+        // silently swallows real typos. Iterate Keys + TryGetValue per match instead.
+        var deferredProps = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var dk in properties.Keys.ToList())
+        {
+            if (ChartHelper.IsDeferredKey(dk) && properties.TryGetValue(dk, out var dv))
+                deferredProps[dk] = dv;
+        }
         if (deferredProps.Count > 0)
             ChartHelper.SetChartProperties(chartPart, deferredProps);
 

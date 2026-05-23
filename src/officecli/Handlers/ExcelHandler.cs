@@ -17,18 +17,34 @@ public partial class ExcelHandler : IDocumentHandler
     private readonly HashSet<WorksheetPart> _dirtyWorksheets = new();
     private bool _dirtyStylesheet;
     private bool _disposed;
+    // Backing FileStream — mirrors the PPT/Word pattern. Opening via a shared
+    // FileStream (FileShare.Read in editable mode) lets external readers
+    // observe the file while the handler is alive, which is required for
+    // mid-session `save` snapshots to be useful to third-party consumers
+    // (issue #114).
+    private FileStream? _backingStream;
     // Row index cache: SheetData → sorted map of rowIndex → Row.
     // Turns the O(n) linear scan in FindOrCreateCell into O(1) lookup + O(log n) insert.
     // Invalidated by InvalidateRowIndex() whenever rows are structurally modified (shift, remove).
     private Dictionary<SheetData, SortedList<uint, Row>>? _rowIndex;
     public int LastFindMatchCount { get; internal set; }
 
+    /// <summary>
+    /// Set true by Add/Set/Remove/RawSet, consumed by Save/Dispose to decide
+    /// whether to stamp <c>docProps/custom.xml</c> with an OfficeCLI audit
+    /// trail. Pure Get/Query sessions leave this false.
+    /// </summary>
+    internal bool Modified { get; set; }
+
     public ExcelHandler(string filePath, bool editable)
     {
         _filePath = filePath;
         try
         {
-            _doc = SpreadsheetDocument.Open(filePath, editable);
+            var share = editable ? FileShare.Read : FileShare.ReadWrite;
+            var access = editable ? FileAccess.ReadWrite : FileAccess.Read;
+            _backingStream = new FileStream(filePath, FileMode.Open, access, share);
+            _doc = SpreadsheetDocument.Open(_backingStream, editable);
             // Force early validation: access WorkbookPart to catch corrupt packages now
             _ = _doc.WorkbookPart?.Workbook;
             // Capture initial sheet names to detect duplicate additions
@@ -232,6 +248,7 @@ public partial class ExcelHandler : IDocumentHandler
 
     public void RawSet(string partPath, string xpath, string action, string? xml)
     {
+        Modified = true;
         if (partPath == null) throw new ArgumentNullException(nameof(partPath));
         var workbookPart = _doc.WorkbookPart
             ?? throw new InvalidOperationException("No workbook part");
@@ -327,12 +344,39 @@ public partial class ExcelHandler : IDocumentHandler
 
     public List<ValidationError> Validate() => RawXmlHelper.ValidateDocument(_doc);
 
+    public void Save()
+    {
+        // Excel mutations defer worksheet/stylesheet writes to FlushDirtyParts
+        // (see ExcelHandler.Helpers.cs). Flush them first so the package
+        // reflects the in-memory tree, then push the package out to the
+        // backing stream and force the OS buffer to disk.
+        FlushDirtyParts();
+        if (Modified)
+        {
+            try { OfficeCli.Core.OfficeCliMetadata.StampOnSave(_doc); }
+            catch { /* best-effort audit trail */ }
+        }
+        _doc.Save();
+        _backingStream?.Flush();
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
-        try { FlushDirtyParts(); }
-        finally { _doc.Dispose(); }
+        try { FlushDirtyParts(); } catch { /* best-effort */ }
+        // Mirror the PPT/Word pattern: when we own the backing FileStream the
+        // package would otherwise leave the on-disk file in whatever state
+        // the last auto-flush left it. Save explicitly before disposing.
+        if (Modified)
+        {
+            try { OfficeCli.Core.OfficeCliMetadata.StampOnSave(_doc); }
+            catch { /* best-effort audit trail */ }
+        }
+        try { _doc.Save(); } catch { /* read-only or already disposed */ }
+        _doc.Dispose();
+        _backingStream?.Dispose();
+        _backingStream = null;
     }
 
 }

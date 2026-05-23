@@ -13,7 +13,7 @@
   "paths": {
     "positional": ["/slide[N]/shape[M]"]
   },
-  "note": "textbox is an alias for shape — both route to AddShape. 'textbox' input that includes --prop formula routes to AddEquation instead. The common text/position/size/font properties are inlined below; the full property surface (geometry, rotation, opacity, name, effects, …) is documented in pptx/shape.json.\n\neffective.* keys (direction, size, font, color, bold) are read-only resolved values walked up the placeholder→layout→master→presentation defaults inheritance chain. They appear only when the direct key is absent on this textbox; once a direct value is set, the corresponding effective.* is suppressed. There are no .src counterparts (the implementation does not emit them).",
+  "note": "Alias for shape — both route to AddShape (with --prop formula → AddEquation). Common text/position/size/font props inlined below; full surface (geometry, rotation, effects, …) in pptx/shape.json. effective.* keys behave as documented in pptx/shape.json.",
   "properties": {
     "text": {
       "type": "string",
@@ -214,9 +214,28 @@
     },
     "zorder": {
       "type": "number",
-      "description": "1-based z-order in slide shape tree.",
-      "add": false, "set": false, "get": true,
+      "description": "1-based z-order in slide shape tree. On add/set, repositions the shape within the shape tree (1 = back).",
+      "aliases": ["z-order", "order"],
+      "add": true, "set": true, "get": true,
+      "examples": ["--prop zorder=1"],
       "readback": "1-based integer (1 = back)",
+      "enforcement": "report"
+    },
+    "name": {
+      "type": "string",
+      "description": "Override the auto-generated 'TextBox {N}' label on cNvPr @name.",
+      "add": true, "set": true, "get": true,
+      "examples": ["--prop name=\"banner\""],
+      "readback": "shape name string (cNvPr @name)",
+      "enforcement": "report"
+    },
+    "lang": {
+      "type": "string",
+      "description": "BCP-47 language tag on first run rPr (drawingML rPr/@lang).",
+      "aliases": ["altLang", "altlang"],
+      "add": true, "set": true, "get": true,
+      "examples": ["--prop lang=en-US"],
+      "readback": "BCP-47 language tag (e.g. \"en-US\")",
       "enforcement": "report"
     }
   }

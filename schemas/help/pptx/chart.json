@@ -94,6 +94,28 @@
       "readback": "integer chart shape id",
       "enforcement": "report"
     },
+    "zorder": {
+      "type": "number",
+      "description": "1-based z-order in slide shape tree. On add, positions the chart within the shape tree (1 = back). Post-creation reordering is not supported via Set; use Move/Swap on the chart graphic frame, or raw-set the spTree child order.",
+      "aliases": ["z-order", "order"],
+      "add": true,
+      "set": false,
+      "get": true,
+      "examples": ["--prop zorder=1"],
+      "readback": "1-based integer (1 = back)",
+      "enforcement": "report"
+    },
+    "chartType": {
+      "type": "enum",
+      "description": "pptx override: chartType is consumed by AddChart (creation only). Switching chart type post-creation is not supported — rebuild the chart with the new type.",
+      "aliases": ["type"],
+      "add": true,
+      "set": false,
+      "get": true,
+      "examples": ["--prop chartType=column"],
+      "readback": "normalized chartType string",
+      "enforcement": "report"
+    },
     "name": {
       "type": "string",
       "add": true,

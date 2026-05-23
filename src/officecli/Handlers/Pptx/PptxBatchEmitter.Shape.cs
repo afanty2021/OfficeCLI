@@ -29,6 +29,42 @@ public static partial class PptxBatchEmitter
             props.Remove("link");
     }
 
+    // Run-level analogue of DeferSlideJumpLink. Target path is the run's
+    // positional path under its paragraph parent; tooltip rides along.
+    private static void DeferRunSlideJumpLink(Dictionary<string, string> props, string paraPath,
+                                              int runIndex, SlideEmitContext ctx)
+    {
+        if (!props.TryGetValue("link", out var linkVal) || string.IsNullOrEmpty(linkVal)) return;
+        if (!SlideJumpLink.IsMatch(linkVal)) return;
+        props.Remove("link");
+        var deferredProps = new Dictionary<string, string>(System.StringComparer.OrdinalIgnoreCase)
+        {
+            ["link"] = linkVal,
+        };
+        if (props.TryGetValue("tooltip", out var tt) && !string.IsNullOrEmpty(tt))
+        {
+            deferredProps["tooltip"] = tt;
+            props.Remove("tooltip");
+        }
+        ctx.DeferredLinks.Add(new BatchItem
+        {
+            Command = "set",
+            Path = $"{paraPath}/run[{runIndex}]",
+            Props = deferredProps,
+        });
+    }
+
+    // R24 — a:pPr accepts none of these (ECMA-376 §21.1.2.2.7 lvlLPr /
+    // §21.1.2.2.6 defaultLevelParagraphProperties — language is part of
+    // a:rPr only). The single-run-collapse path used to spill these onto
+    // the paragraph set bag, which Set then routed into `unsupported`.
+    private static readonly HashSet<string> RunOnlyRprAttrs =
+        new(StringComparer.OrdinalIgnoreCase)
+    {
+        "lang", "altLang", "kern", "kumimoji", "normalizeH",
+        "smtClean", "smtId", "bmk", "dirty", "err", "baseline",
+    };
+
     // Pull a `link=slide[N]` prop out of the bag and queue a deferred `set`
     // BatchItem so the link write runs after every slide has been added.
     // External URLs and named actions stay in the prop bag for the normal
@@ -71,18 +107,30 @@ public static partial class PptxBatchEmitter
         DeferSlideJumpLink(shapeProps, replayPath, ctx);
 
         // NodeBuilder emits `geometry=rect` for every shape with the implicit
-        // <a:prstGeom prst="rect"/> body — including plain text boxes. Replay
-        // routes any shape carrying `geometry=` through AddShape, which (per
-        // bbe1a0c8) seeds a default outline when the caller picks a geometry
-        // but supplies no explicit fill/line. The result is a round-trip
-        // drift: a clean textbox grows a 1pt black border on every dump+replay.
-        // Strip the rect default for textbox/title sources; explicit `shape`
-        // types keep the geometry so AddShape sees the user's intent.
-        if ((shapeNode.Type == "textbox" || shapeNode.Type == "title")
-            && shapeProps.TryGetValue("geometry", out var geomVal)
+        // <a:prstGeom prst="rect"/> body — including plain text boxes and
+        // bare `--type shape` calls (no styling). Strip the rect default for
+        // textbox/title (they don't "own" a geometry concept, so echoing it
+        // back would attach a shape signal to a textbox on replay) and for
+        // bare default-flavor shapes that carry no other distinguishing
+        // styling. When the source explicitly set fill/line/etc., keep
+        // `geometry=rect` so the replay path sees the same prop bag.
+        if (shapeProps.TryGetValue("geometry", out var geomVal)
             && geomVal.Equals("rect", StringComparison.OrdinalIgnoreCase))
         {
-            shapeProps.Remove("geometry");
+            bool stripRect = shapeNode.Type == "textbox" || shapeNode.Type == "title";
+            if (!stripRect && shapeNode.Type == "shape")
+            {
+                bool hasExplicitStyling =
+                    shapeProps.ContainsKey("fill")
+                    || shapeProps.ContainsKey("gradient")
+                    || shapeProps.ContainsKey("pattern")
+                    || shapeProps.ContainsKey("line")
+                    || shapeProps.ContainsKey("lineWidth")
+                    || shapeProps.ContainsKey("lineDash")
+                    || shapeProps.ContainsKey("opacity");
+                stripRect = !hasExplicitStyling;
+            }
+            if (stripRect) shapeProps.Remove("geometry");
         }
 
         // Emit type matches Add dispatch: "title" / "equation" both reduce to
@@ -95,11 +143,16 @@ public static partial class PptxBatchEmitter
         // (exotic OMath that ToLatex can't render), degrade to a plain textbox
         // emit rather than crash replay.
         bool isEquation = shapeNode.Type == "equation" && shapeProps.ContainsKey("formula");
+        // Preserve the shape/textbox distinction on emit: NodeBuilder's Type
+        // already reflects the on-disk txBox flag, so route by Type rather
+        // than reverse-engineering it from geometry presence (which we may
+        // have just stripped above).
         string emitType = shapeNode.Type switch
         {
             "title" => "shape",
-            "equation" => isEquation ? "equation" : (shapeProps.ContainsKey("geometry") ? "shape" : "textbox"),
-            _ => shapeProps.ContainsKey("geometry") ? "shape" : "textbox",
+            "equation" => isEquation ? "equation" : "shape",
+            "shape" => "shape",
+            _ => "textbox",
         };
 
         items.Add(new BatchItem
@@ -116,7 +169,16 @@ public static partial class PptxBatchEmitter
         // user text — skip the body walk for equations entirely.
         if (isEquation) return;
 
-        EmitTextBody(ppt, fullShape, replayPath, items);
+        // CONSISTENCY(shape-empty-seed): since commit c574db7a, CreateTextShape
+        // emits `<a:p/>` (no <a:r>) for the empty-text path — the same shape
+        // PowerPoint writes for a fresh empty text body. The emitted shape `add`
+        // op above never carries `text=` (text always replays via per-paragraph /
+        // per-run ops), so AddShape/AddTextbox always seeds paragraph[1] with
+        // zero runs. EmitTextBody must therefore tell EmitParagraph the seeded
+        // first paragraph has no run — otherwise the multi-run path emits
+        // `set run[1]` against a run that doesn't exist on replay, breaking
+        // round-trip for any shape whose first paragraph has >1 run.
+        EmitTextBody(ppt, fullShape, replayPath, items, seededFirstParaHasRun: false, ctx: ctx);
     }
 
     private static void EmitPlaceholder(PowerPointHandler ppt, DocumentNode phNode, string parentSlidePath,
@@ -134,7 +196,12 @@ public static partial class PptxBatchEmitter
             Props = props.Count > 0 ? props : null,
         });
 
-        EmitTextBody(ppt, full, replayPath, items);
+        // AddPlaceholder seeds the first paragraph with <a:endParaRPr> only —
+        // no <a:r>. Emitting the first run via `set run[1]` (the shape/textbox
+        // path) targets a non-existent run and fails the batch. Tell
+        // EmitTextBody the seeded paragraph has zero runs so it issues `add
+        // run` for the first run instead.
+        EmitTextBody(ppt, full, replayPath, items, seededFirstParaHasRun: false, ctx: ctx);
     }
 
     private static void EmitConnector(PowerPointHandler ppt, DocumentNode cxnNode, string parentSlidePath,
@@ -142,6 +209,17 @@ public static partial class PptxBatchEmitter
     {
         var full = ppt.Get(cxnNode.Path);
         var props = FilterEmittableProps(full.Format);
+
+        // R24 — NodeBuilder emits startShape / endShape as raw OOXML shape IDs.
+        // Replay reassigns IDs through AcquireShapeId, so the original numeric
+        // ID will reference the wrong shape (or be out of range) by the time
+        // Add runs on a fresh deck. Translate to the positional path form that
+        // ResolveShapeId already accepts (`/slide[N]/shape[K]`) so the endpoint
+        // re-resolves against whatever shape sits at that ordinal in the
+        // rebuilt slide. The translation is done eagerly against the source
+        // slide because the source still has the original IDs.
+        TranslateConnectorEndpoint(ppt, cxnNode, props, "startShape", "from");
+        TranslateConnectorEndpoint(ppt, cxnNode, props, "endShape", "to");
 
         items.Add(new BatchItem
         {
@@ -152,11 +230,46 @@ public static partial class PptxBatchEmitter
         });
     }
 
+    private static void TranslateConnectorEndpoint(PowerPointHandler ppt,
+        DocumentNode cxnNode, Dictionary<string, string> props,
+        string srcKey, string dstKey)
+    {
+        if (!props.TryGetValue(srcKey, out var idStr)) return;
+        if (!uint.TryParse(idStr, out var id)) return;
+        // cxnNode.Path is /slide[N]/connector[K]; derive the slide number.
+        var slideMatch = System.Text.RegularExpressions.Regex.Match(cxnNode.Path ?? "", @"^/slide\[(\d+)\]");
+        if (!slideMatch.Success) return;
+        var slideIdx = int.Parse(slideMatch.Groups[1].Value);
+        var shapePathIdx = ppt.ResolveShapeOrdinalById(slideIdx, id);
+        if (shapePathIdx == null) return; // Endpoint refers to a shape we
+                                          // can't find on this slide (cross-
+                                          // slide cxn, group-nested, etc.);
+                                          // leave the raw id and let Add
+                                          // emit a warning instead.
+        props.Remove(srcKey);
+        props[dstKey] = $"/slide[{slideIdx}]/shape[{shapePathIdx}]";
+        // Drop the auxiliary index — Add re-derives the connection point.
+        props.Remove(srcKey == "startShape" ? "startIdx" : "endIdx");
+    }
+
     private static void EmitGroup(PowerPointHandler ppt, DocumentNode grpNode, string parentSlidePath,
                                   string replayPath, List<BatchItem> items, SlideEmitContext ctx)
     {
         var full = ppt.Get(grpNode.Path);
         var props = FilterEmittableProps(full.Format);
+        // CONSISTENCY(zorder): direct Get on /slide[N]/group[K] strips zorder
+        // because the NodeBuilder branch that emits it only runs when the
+        // group surfaces as a *child* of the slide enumeration (the source
+        // grpNode passed in). Without preserving zorder, a slide with
+        // [group, shape] at zorders [1, 2] replays as [shape, group] = [1, 2]
+        // — the group lands AFTER the shape because AddGroup defaults to
+        // append. Mirror group.json (now declares add/set=true on zorder).
+        if (!props.ContainsKey("zorder")
+            && grpNode.Format.TryGetValue("zorder", out var grpZ) && grpZ != null)
+        {
+            var s = grpZ.ToString();
+            if (!string.IsNullOrEmpty(s)) props["zorder"] = s!;
+        }
         DeferSlideJumpLink(props, replayPath, ctx);
 
         items.Add(new BatchItem
@@ -193,8 +306,10 @@ public static partial class PptxBatchEmitter
                     EmitGroup(ppt, child, replayPath, $"{replayPath}/group[{ord["group"]}]", items, ctx);
                     break;
                 case "placeholder":
-                    ord["placeholder"] = ord.GetValueOrDefault("placeholder", 0) + 1;
-                    EmitPlaceholder(ppt, child, replayPath, $"{replayPath}/placeholder[{ord["placeholder"]}]", items, ctx);
+                    // CONSISTENCY(unified-shape-counter): placeholders and
+                    // plain shapes share <p:sp> sibling positions.
+                    ord["shape"] = ord.GetValueOrDefault("shape", 0) + 1;
+                    EmitPlaceholder(ppt, child, replayPath, $"{replayPath}/shape[{ord["shape"]}]", items, ctx);
                     break;
                 default:
                     ctx.Unsupported.Add(new UnsupportedWarning(
@@ -211,7 +326,8 @@ public static partial class PptxBatchEmitter
     // paragraph (with text carried as the canonical "text" prop). Single-run
     // paragraphs collapse run props onto the paragraph itself, mirroring the
     // docx single-run optimization.
-    private static void EmitTextBody(PowerPointHandler ppt, DocumentNode shapeNode, string shapeParent, List<BatchItem> items)
+    private static void EmitTextBody(PowerPointHandler ppt, DocumentNode shapeNode, string shapeParent, List<BatchItem> items,
+                                     bool seededFirstParaHasRun = true, SlideEmitContext? ctx = null)
     {
         if (shapeNode.Children == null) return;
         var paragraphs = shapeNode.Children.Where(c => c.Type == "paragraph" || c.Type == "p").ToList();
@@ -232,12 +348,17 @@ public static partial class PptxBatchEmitter
             // subsequent paragraphs append via `add`. docx body has no
             // equivalent auto-empty seed (AddSection initializes an empty body
             // and AddParagraph appends), so WordBatchEmitter uses pure `add`.
-            EmitParagraph(ppt, para, shapeParent, pIdx, items, firstParagraph: pIdx == 1);
+            EmitParagraph(ppt, para, shapeParent, pIdx, items,
+                firstParagraph: pIdx == 1,
+                seededParaHasRun: pIdx == 1 && seededFirstParaHasRun,
+                ctx: ctx);
         }
     }
 
     private static void EmitParagraph(PowerPointHandler ppt, DocumentNode paraNode, string shapeParent,
-                                      int paraIdx, List<BatchItem> items, bool firstParagraph)
+                                      int paraIdx, List<BatchItem> items, bool firstParagraph,
+                                      bool seededParaHasRun = true,
+                                      SlideEmitContext? ctx = null)
     {
         var props = FilterEmittableProps(paraNode.Format);
         // CONSISTENCY(slide-jump-defer): the shape-level emit already deferred
@@ -258,12 +379,28 @@ public static partial class PptxBatchEmitter
         {
             var runProps = FilterEmittableProps(runs[0].Format);
             DummyCtxStripSlideJump(runProps);
+            // R24 — run-only rPr attributes (lang, altLang, kern, kumimoji,
+            // normalizeH, smtClean, smtId, bmk, dirty, err, baseline) are not
+            // valid on a:pPr. The collapse used to dump them onto the
+            // paragraph set, which then routed them into `unsupported`. Split
+            // them out and apply them via a follow-up `set …/run[1]` so the
+            // round-trip still captures the rPr attribute on the right node.
+            var runOnly = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var k in RunOnlyRprAttrs)
+            {
+                if (runProps.TryGetValue(k, out var v))
+                {
+                    runOnly[k] = v;
+                    runProps.Remove(k);
+                }
+            }
             foreach (var (k, v) in runProps)
             {
                 if (!props.ContainsKey(k)) props[k] = v;
             }
             if (!string.IsNullOrEmpty(runs[0].Text))
                 props["text"] = runs[0].Text!;
+            string collapsedParaPath;
             if (firstParagraph)
             {
                 items.Add(new BatchItem
@@ -272,6 +409,7 @@ public static partial class PptxBatchEmitter
                     Path = $"{shapeParent}/paragraph[1]",
                     Props = props.Count > 0 ? props : null,
                 });
+                collapsedParaPath = $"{shapeParent}/paragraph[1]";
             }
             else
             {
@@ -282,6 +420,41 @@ public static partial class PptxBatchEmitter
                     Type = "paragraph",
                     Props = props.Count > 0 ? props : null,
                 });
+                collapsedParaPath = $"{shapeParent}/paragraph[{paraIdx}]";
+            }
+            if (runOnly.Count > 0)
+            {
+                // CONSISTENCY(empty-paragraph-no-run): when the paragraph carried
+                // no text and the run-only attrs reduce to AddRun's hard-coded
+                // seeds (lang/altLang), there is no useful round-trip — emitting
+                // `add run` would only re-seed the same values and grow noise
+                // each cycle. Skip the row entirely (matches EmitRun /
+                // EmitFirstRunAsSet's RunDefaultOnlyKeys filter).
+                bool collapseHasText = props.ContainsKey("text");
+                if (!collapseHasText
+                    && runOnly.Keys.All(k => RunDefaultOnlyKeys.Contains(k)))
+                {
+                    return;
+                }
+                if (firstParagraph && !seededParaHasRun && !collapseHasText)
+                {
+                    items.Add(new BatchItem
+                    {
+                        Command = "add",
+                        Parent = collapsedParaPath,
+                        Type = "run",
+                        Props = runOnly,
+                    });
+                }
+                else
+                {
+                    items.Add(new BatchItem
+                    {
+                        Command = "set",
+                        Path = $"{collapsedParaPath}/run[1]",
+                        Props = runOnly,
+                    });
+                }
             }
             return;
         }
@@ -324,13 +497,16 @@ public static partial class PptxBatchEmitter
         // and drifts by +1 run per round-trip. Mirror the single-paragraph
         // rewrite: the FIRST run of the FIRST paragraph rewrites the seeded
         // empty run via `set .../run[1]` rather than `add run`.
-        bool firstRunOnSeededParagraph = firstParagraph && runs.Count > 0;
+        // AddPlaceholder's seeded paragraph has zero <a:r> elements (only
+        // <a:endParaRPr>), so `set run[1]` would target a missing run. Only
+        // rewrite-the-seed when an actual run was seeded (shape/textbox path).
+        bool firstRunOnSeededParagraph = firstParagraph && runs.Count > 0 && seededParaHasRun;
         for (int ri = 0; ri < runs.Count; ri++)
         {
             if (ri == 0 && firstRunOnSeededParagraph)
-                EmitFirstRunAsSet(runs[ri], paraParent, items);
+                EmitFirstRunAsSet(runs[ri], paraParent, items, ctx);
             else
-                EmitRun(runs[ri], paraParent, items);
+                EmitRun(runs[ri], paraParent, items, ctx, runIndex: ri + 1);
         }
     }
 
@@ -339,10 +515,12 @@ public static partial class PptxBatchEmitter
     // <paraParent>/run[1]. Empty/lang-only seeded runs in the source are
     // filtered the same way EmitRun filters; an empty rewrite is a no-op set
     // with no props.
-    private static void EmitFirstRunAsSet(DocumentNode runNode, string paraParent, List<BatchItem> items)
+    private static void EmitFirstRunAsSet(DocumentNode runNode, string paraParent, List<BatchItem> items,
+                                          SlideEmitContext? ctx = null)
     {
         var props = FilterEmittableProps(runNode.Format);
-        DummyCtxStripSlideJump(props);
+        if (ctx != null) DeferRunSlideJumpLink(props, paraParent, 1, ctx);
+        else DummyCtxStripSlideJump(props);
         bool hasText = !string.IsNullOrEmpty(runNode.Text);
         if (!hasText && props.Count > 0
             && props.Keys.All(k => RunDefaultOnlyKeys.Contains(k)))
@@ -370,10 +548,18 @@ public static partial class PptxBatchEmitter
         "lang", "altLang",
     };
 
-    private static void EmitRun(DocumentNode runNode, string paraParent, List<BatchItem> items)
+    private static void EmitRun(DocumentNode runNode, string paraParent, List<BatchItem> items,
+                                SlideEmitContext? ctx = null, int runIndex = 0)
     {
         var props = FilterEmittableProps(runNode.Format);
-        DummyCtxStripSlideJump(props);
+        // Defer run-level slide-jump links the same way shape-level links are
+        // deferred — emit a follow-up `set` BatchItem against the run path
+        // once every target slide is materialized. Without this, run-internal
+        // `link=slide[N]` was silently stripped and the rendered run lost its
+        // hyperlink on replay. External URLs / named actions / mailto stay in
+        // the run prop bag and AddRun.ApplyRunHyperlink handles them inline.
+        if (ctx != null) DeferRunSlideJumpLink(props, paraParent, runIndex, ctx);
+        else DummyCtxStripSlideJump(props);
         bool hasText = !string.IsNullOrEmpty(runNode.Text);
 
         // Drop runs that carry no text and only default attributes AddRun

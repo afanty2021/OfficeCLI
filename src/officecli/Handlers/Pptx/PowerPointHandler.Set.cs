@@ -14,6 +14,7 @@ public partial class PowerPointHandler
 {
     public List<string> Set(string path, Dictionary<string, string> properties)
     {
+        Modified = true;
         path = NormalizePptxPathSegmentCasing(path);
         path = NormalizeCellPath(path);
         path = ResolveIdPath(path);
@@ -231,8 +232,10 @@ public partial class PowerPointHandler
         var notesSetMatch = Regex.Match(path, @"^/slide\[(\d+)\]/notes$");
         if (notesSetMatch.Success) return SetNotesByPath(notesSetMatch, properties);
 
-        // Try animation path: /slide[N]/shape[M]/animation[A]
-        var animSetMatch = Regex.Match(path, @"^/slide\[(\d+)\]/shape\[(\d+)\]/animation\[(\d+)\]$");
+        // Try animation path: /slide[N]/(shape|chart)[M]/animation[A].
+        // CONSISTENCY(animation-target): chart graphicFrames route through the
+        // same SetShapeAnimationByPath which now accepts either element kind.
+        var animSetMatch = Regex.Match(path, @"^/slide\[(\d+)\]/(shape|chart)\[(\d+)\]/animation\[(\d+)\]$");
         if (animSetMatch.Success) return SetShapeAnimationByPath(animSetMatch, properties);
 
         // CONSISTENCY(path-aliases): PPT accepts both long-form (`/run[N]`,
@@ -278,6 +281,13 @@ public partial class PowerPointHandler
         // Try table column path: /slide[N]/table[M]/col[C]
         var tblColMatch = Regex.Match(path, @"^/slide\[(\d+)\]/table\[(\d+)\]/col\[(\d+)\]$");
         if (tblColMatch.Success) return SetTableColByPath(tblColMatch, properties);
+
+        // Try title shorthand path: /slide[N]/title[K] — K-th title-type shape on the slide.
+        // CONSISTENCY(placeholder-aliases): mirrors how /slide[N]/placeholder[title] resolves
+        // (ResolvePlaceholderShape by type), so users who learned `title[K]` from rendered
+        // HTML / outline view can address the title shape without knowing the placeholder id.
+        var titleIdxMatch = Regex.Match(path, @"^/slide\[(\d+)\]/title\[(\d+)\]$");
+        if (titleIdxMatch.Success) return SetTitleByPath(titleIdxMatch, properties);
 
         // Try placeholder paragraph/run path: /slide[N]/placeholder[X]/paragraph[P]/run[K]
         var phParaRunMatch = Regex.Match(path, @"^/slide\[(\d+)\]/placeholder\[(\w+)\]/(?:paragraph|p)\[(\d+)\]/(?:run|r)\[(\d+)\]$");
@@ -339,6 +349,18 @@ public partial class PowerPointHandler
         var grpParaMatch = Regex.Match(path, @"^/slide\[(\d+)\]/group\[(\d+)\]/shape\[(\d+)\]/(?:paragraph|p)\[(\d+)\]$");
         if (grpParaMatch.Success) return SetGroupParagraphByPath(grpParaMatch, properties);
 
+        // Try arbitrary-depth group descent for shape leaves:
+        //   /slide[N]/group[M](/group[L])+/shape[K]
+        // CONSISTENCY(group-inner-shape): Query.cs already walks arbitrary-depth
+        // group chains (see Query.cs:836 nestedGroupMatch). Set must too —
+        // without this branch, /slide[1]/group[1]/group[1]/shape[1] falls
+        // through to the XML-fallback and errors with "Element not found".
+        // Match nested-only (≥2 group segments); the depth-1 case below stays.
+        var nestedGrpInnerShapeMatch = Regex.Match(path,
+            @"^/slide\[(\d+)\]/group\[(\d+)\]((?:/group\[\d+\])+)/shape\[(\d+)\]$");
+        if (nestedGrpInnerShapeMatch.Success)
+            return SetNestedGroupInnerShapeByPath(nestedGrpInnerShapeMatch, properties);
+
         // Try group inner shape path: /slide[N]/group[M]/shape[K]
         // CONSISTENCY(group-inner-shape): Get supports this; Set must too.
         var grpInnerShapeMatch = Regex.Match(path, @"^/slide\[(\d+)\]/group\[(\d+)\]/shape\[(\d+)\]$");
@@ -357,6 +379,28 @@ public partial class PowerPointHandler
             var unsupported = SetSlideCommentProperties(resolved.comment, properties);
             resolved.slide.SlideCommentsPart!.CommentList!.Save();
             return unsupported;
+        }
+
+        // Modern p188 threaded comments: /slide[N]/moderncomment[K] or
+        // /slide[N]/moderncomment[K]/reply[R]. Path was lowercased by
+        // NormalizePptxPathSegmentCasing, so match the folded form.
+        var mcReplyMatch = Regex.Match(path, @"^/slide\[(\d+)\]/moderncomment\[(\d+)\]/reply\[(\d+)\]$");
+        if (mcReplyMatch.Success)
+        {
+            var rResolved = ResolveModernCommentReply(path)
+                ?? throw new ArgumentException($"Modern comment reply not found: {path}");
+            var u = SetModernCommentProperties(rResolved.part, rResolved.reply, properties);
+            rResolved.part.CommentList!.Save();
+            return u;
+        }
+        var mcMatch = Regex.Match(path, @"^/slide\[(\d+)\]/moderncomment\[(\d+)\]$");
+        if (mcMatch.Success)
+        {
+            var resolved = ResolveModernComment(path)
+                ?? throw new ArgumentException($"Modern comment not found: {path}");
+            var u = SetModernCommentProperties(resolved.part, resolved.comment, properties);
+            resolved.part.CommentList!.Save();
+            return u;
         }
 
         // Generic XML fallback: navigate to element and set attributes

@@ -85,6 +85,12 @@ static partial class CommandBuilder
                         : $"Resident close reported error (exit {closeResp.ExitCode})";
                     throw new InvalidOperationException(err);
                 }
+                // BUG-INTERVIEW-EDIT-R10-B: resident reports advisory warnings
+                // (e.g. backing file missing at original path) via Stderr with
+                // exit=0. Forward to the client's stderr so the user sees the
+                // warning instead of a silent success.
+                if (closeResp != null && !string.IsNullOrEmpty(closeResp.Stderr))
+                    Console.Error.WriteLine(closeResp.Stderr);
                 var msg = $"Resident closed for {file.Name}";
                 if (json) Console.WriteLine(OutputFormatter.WrapEnvelopeText(msg));
                 else Console.WriteLine(msg);
@@ -133,6 +139,7 @@ static partial class CommandBuilder
         rootCommand.Add(BuildRawSetCommand(jsonOption));
         rootCommand.Add(BuildAddPartCommand(jsonOption));
         rootCommand.Add(BuildValidateCommand(jsonOption));
+        rootCommand.Add(BuildSaveCommand(jsonOption));
         rootCommand.Add(BuildBatchCommand(jsonOption));
         rootCommand.Add(BuildDumpCommand(jsonOption));
         rootCommand.Add(BuildImportCommand(jsonOption));
@@ -246,7 +253,17 @@ static partial class CommandBuilder
             if (process.HasExited)
             {
                 var stderr = process.StandardError.ReadToEnd();
-                error = $"Resident process exited. {stderr}";
+                // CONSISTENCY(cli-error-first-line): the resident process dumps its
+                // full call stack on a startup crash; surface only the first line
+                // (typically the exception message). The stack is still in the
+                // resident's own log if needed for diagnostics — keeping it out
+                // of the user-facing CLI error avoids burying the actual cause.
+                var firstLine = string.IsNullOrEmpty(stderr)
+                    ? ""
+                    : stderr.Split('\n', 2)[0].TrimEnd('\r').Trim();
+                error = string.IsNullOrEmpty(firstLine)
+                    ? "Resident process exited."
+                    : $"Resident process exited. {firstLine}";
                 process.Dispose();
                 return false;
             }
@@ -433,7 +450,7 @@ static partial class CommandBuilder
         }
         else
         {
-            Console.Error.WriteLine($"Error: {rendered.Message}");
+            Console.Error.WriteLine($"Error: {OfficeCli.Core.MsysPathHint.AugmentMessage(rendered.Message)}");
         }
     }
 
@@ -685,6 +702,15 @@ static partial class CommandBuilder
                 handler.RawSet(partPath, xpath, action, item.Xml);
                 return $"raw-set {action} applied";
             }
+            case "add-part":
+            {
+                if (string.IsNullOrEmpty(item.Parent))
+                    throw new ArgumentException("'add-part' command requires 'parent' field. Example: {\"command\": \"add-part\", \"parent\": \"/slide[1]\", \"type\": \"smartart\", \"props\": {\"data\": \"rId2\"}}");
+                if (string.IsNullOrEmpty(item.Type))
+                    throw new ArgumentException("'add-part' command requires 'type' field. Supported (pptx): chart, smartart, video, audio, model3d, ole.");
+                var (relId, partOut) = handler.AddPart(item.Parent, item.Type, props);
+                return $"Created {item.Type} part: relId={relId} path={partOut}";
+            }
             case "validate":
             {
                 var errors = handler.Validate();
@@ -723,7 +749,27 @@ static partial class CommandBuilder
                 throw new ArgumentException(
                     $"Invalid --prop '{prop}': key is empty. Use key=value (e.g. --prop name=Title).");
             if (eqIdx > 0)
-                dict[prop[..eqIdx]] = prop[(eqIdx + 1)..];
+            {
+                var key = prop[..eqIdx];
+                var value = prop[(eqIdx + 1)..];
+                // CONSISTENCY(text-escape-boundary): C-style escape resolution
+                // (\\n, \\t, \\r, \\\\) is a CLI-input concern only. The shell
+                // gives us the literal four-character sequence `\\n` which a
+                // user typing `--prop text='line1\\nline2'` plainly wants as
+                // a newline. Handlers no longer call TextEscape.Resolve
+                // internally — that double-resolution mangled batch JSON
+                // payloads, where `"text": "hello\\nworld"` already arrives
+                // as `hello\\nworld` literal after JSON parsing and must NOT
+                // be turned into a newline. Only `text` and `value` are
+                // affected; other props (colors, paths, numbers) are passed
+                // through untouched.
+                if (key.Equals("text", StringComparison.OrdinalIgnoreCase)
+                    || key.Equals("value", StringComparison.OrdinalIgnoreCase))
+                {
+                    value = OfficeCli.Core.TextEscape.Resolve(value);
+                }
+                dict[key] = value;
+            }
         }
         return dict;
     }

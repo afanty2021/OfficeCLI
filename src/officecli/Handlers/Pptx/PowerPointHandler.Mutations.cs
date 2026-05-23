@@ -15,6 +15,7 @@ public partial class PowerPointHandler
 {
     public string? Remove(string path)
     {
+        Modified = true;
         // CONSISTENCY(null-path-guard): callers that pass null get an
         // ArgumentNullException instead of a confusing downstream NRE.
         // Mirrors the Word/Excel guards on the same surface.
@@ -65,6 +66,18 @@ public partial class PowerPointHandler
         {
             if (!RemoveSlideComment(path))
                 throw new ArgumentException($"Comment not found: {path}");
+            return null;
+        }
+
+        // Modern p188 threaded comment removal — top-level path removes the
+        // whole thread (mirror PowerPoint UI); reply path removes just one
+        // reply.
+        var mcRemoveMatch = Regex.Match(path,
+            @"^/slide\[(\d+)\]/moderncomment\[(\d+)\](?:/reply\[(\d+)\])?$");
+        if (mcRemoveMatch.Success)
+        {
+            if (!RemoveModernComment(path))
+                throw new ArgumentException($"Modern comment not found: {path}");
             return null;
         }
 
@@ -196,17 +209,30 @@ public partial class PowerPointHandler
             return null;
         }
 
-        // BUG C-P-4: /slide[N]/shape[M]/animation[K] removal. Mirrors the
-        // enumeration model used by AddAnimation/Get/Set (EnumerateShape-
-        // AnimationCTns) so Add/Get/Set/Remove all share the same indexing.
-        var animRemoveMatch = Regex.Match(path, @"^/slide\[(\d+)\]/shape\[(\d+)\]/animation\[(\d+)\]$");
+        // BUG C-P-4: /slide[N]/(shape|chart)[M]/animation[K] removal. Mirrors
+        // the enumeration model used by AddAnimation/Get/Set so Add/Get/Set/Remove
+        // all share the same indexing. CONSISTENCY(animation-target): chart
+        // graphicFrames participate the same way shapes do.
+        var animRemoveMatch = Regex.Match(path, @"^/slide\[(\d+)\]/(shape|chart)\[(\d+)\]/animation\[(\d+)\]$");
         if (animRemoveMatch.Success)
         {
             var animSlideIdx = int.Parse(animRemoveMatch.Groups[1].Value);
-            var animShapeIdx = int.Parse(animRemoveMatch.Groups[2].Value);
-            var animKIdx = int.Parse(animRemoveMatch.Groups[3].Value);
-            var (animSlidePart, animShape) = ResolveShape(animSlideIdx, animShapeIdx);
-            RemoveSingleShapeAnimation(animSlidePart, animShape, animKIdx);
+            var animKind = animRemoveMatch.Groups[2].Value;
+            var animElIdx = int.Parse(animRemoveMatch.Groups[3].Value);
+            var animKIdx = int.Parse(animRemoveMatch.Groups[4].Value);
+            SlidePart animSlidePart;
+            OpenXmlElement animTargetEl;
+            if (animKind == "chart")
+            {
+                var (sp, gf, _, _) = ResolveChart(animSlideIdx, animElIdx);
+                animSlidePart = sp; animTargetEl = gf;
+            }
+            else
+            {
+                var (sp, sh) = ResolveShape(animSlideIdx, animElIdx);
+                animSlidePart = sp; animTargetEl = sh;
+            }
+            RemoveSingleShapeAnimation(animSlidePart, animTargetEl, animKIdx);
             GetSlide(animSlidePart).Save();
             return null;
         }
@@ -237,6 +263,68 @@ public partial class PowerPointHandler
                 throw new ArgumentException($"Shape {shapeIdx1} not found (total: {mlShapes.Count})");
             mlShapes[shapeIdx1 - 1].Remove();
             mlRoot.Save();
+            return null;
+        }
+
+        // CONSISTENCY(pptx-deep-text-remove): Query emits and Set accepts
+        // paragraph/run sub-paths on shapes and placeholders; Remove must too.
+        // Mirrors the resolution helpers used by Set.Shape (ResolveShape /
+        // ResolvePlaceholderShape) — no fingerprinting, pure positional path.
+        var runRemoveMatch = Regex.Match(path,
+            @"^/slide\[(\d+)\]/shape\[(\d+)\]/(?:paragraph|p)\[(\d+)\]/(?:run|r)\[(\d+)\]$");
+        if (runRemoveMatch.Success)
+        {
+            var rSlideIdx = int.Parse(runRemoveMatch.Groups[1].Value);
+            var rShapeIdx = int.Parse(runRemoveMatch.Groups[2].Value);
+            var rParaIdx = int.Parse(runRemoveMatch.Groups[3].Value);
+            var rRunIdx = int.Parse(runRemoveMatch.Groups[4].Value);
+            var (rSlidePart, rShape) = ResolveShape(rSlideIdx, rShapeIdx);
+            RemoveParagraphRunOnShape(rSlidePart, rShape, rParaIdx, rRunIdx);
+            return null;
+        }
+
+        var paraRemoveMatch = Regex.Match(path,
+            @"^/slide\[(\d+)\]/shape\[(\d+)\]/(?:paragraph|p)\[(\d+)\]$");
+        if (paraRemoveMatch.Success)
+        {
+            var pSlideIdx = int.Parse(paraRemoveMatch.Groups[1].Value);
+            var pShapeIdx = int.Parse(paraRemoveMatch.Groups[2].Value);
+            var pParaIdx = int.Parse(paraRemoveMatch.Groups[3].Value);
+            var (pSlidePart, pShape) = ResolveShape(pSlideIdx, pShapeIdx);
+            RemoveParagraphOnShape(pSlidePart, pShape, pParaIdx);
+            return null;
+        }
+
+        var phRunRemoveMatch = Regex.Match(path,
+            @"^/slide\[(\d+)\]/placeholder\[(\w+)\]/(?:paragraph|p)\[(\d+)\]/(?:run|r)\[(\d+)\]$");
+        if (phRunRemoveMatch.Success)
+        {
+            var phSlideIdx = int.Parse(phRunRemoveMatch.Groups[1].Value);
+            var phId = phRunRemoveMatch.Groups[2].Value;
+            var phParaIdx = int.Parse(phRunRemoveMatch.Groups[3].Value);
+            var phRunIdx = int.Parse(phRunRemoveMatch.Groups[4].Value);
+            var phSlideParts = GetSlideParts().ToList();
+            if (phSlideIdx < 1 || phSlideIdx > phSlideParts.Count)
+                throw new ArgumentException($"Slide {phSlideIdx} not found (total: {phSlideParts.Count})");
+            var phSlidePart = phSlideParts[phSlideIdx - 1];
+            var phShape = ResolvePlaceholderShape(phSlidePart, phId);
+            RemoveParagraphRunOnShape(phSlidePart, phShape, phParaIdx, phRunIdx);
+            return null;
+        }
+
+        var phParaRemoveMatch = Regex.Match(path,
+            @"^/slide\[(\d+)\]/placeholder\[(\w+)\]/(?:paragraph|p)\[(\d+)\]$");
+        if (phParaRemoveMatch.Success)
+        {
+            var phSlideIdx = int.Parse(phParaRemoveMatch.Groups[1].Value);
+            var phId = phParaRemoveMatch.Groups[2].Value;
+            var phParaIdx = int.Parse(phParaRemoveMatch.Groups[3].Value);
+            var phSlideParts = GetSlideParts().ToList();
+            if (phSlideIdx < 1 || phSlideIdx > phSlideParts.Count)
+                throw new ArgumentException($"Slide {phSlideIdx} not found (total: {phSlideParts.Count})");
+            var phSlidePart = phSlideParts[phSlideIdx - 1];
+            var phShape = ResolvePlaceholderShape(phSlidePart, phId);
+            RemoveParagraphOnShape(phSlidePart, phShape, phParaIdx);
             return null;
         }
 
@@ -1756,5 +1844,29 @@ public partial class PowerPointHandler
     {
         if (string.IsNullOrEmpty(path)) return false;
         return ProtectedPptxContainerPaths.Contains(path.TrimEnd('/'));
+    }
+
+    private void RemoveParagraphRunOnShape(SlidePart slidePart, Shape shape, int paraIdx, int runIdx)
+    {
+        var paragraphs = shape.TextBody?.Elements<Drawing.Paragraph>().ToList()
+            ?? throw new ArgumentException("Shape has no text body");
+        if (paraIdx < 1 || paraIdx > paragraphs.Count)
+            throw new ArgumentException($"Paragraph {paraIdx} not found (shape has {paragraphs.Count} paragraphs)");
+        var para = paragraphs[paraIdx - 1];
+        var runs = para.Elements<Drawing.Run>().ToList();
+        if (runIdx < 1 || runIdx > runs.Count)
+            throw new ArgumentException($"Run {runIdx} not found (paragraph has {runs.Count} runs)");
+        runs[runIdx - 1].Remove();
+        GetSlide(slidePart).Save();
+    }
+
+    private void RemoveParagraphOnShape(SlidePart slidePart, Shape shape, int paraIdx)
+    {
+        var paragraphs = shape.TextBody?.Elements<Drawing.Paragraph>().ToList()
+            ?? throw new ArgumentException("Shape has no text body");
+        if (paraIdx < 1 || paraIdx > paragraphs.Count)
+            throw new ArgumentException($"Paragraph {paraIdx} not found (shape has {paragraphs.Count} paragraphs)");
+        paragraphs[paraIdx - 1].Remove();
+        GetSlide(slidePart).Save();
     }
 }

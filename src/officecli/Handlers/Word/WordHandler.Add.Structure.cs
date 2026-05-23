@@ -122,6 +122,15 @@ public partial class WordHandler
             var cols = EnsureSectPrChild<Columns>(sectPr);
             cols.Space = ParseTwips(colSpace).ToString();
         }
+        // columns.equalWidth — Set.SectionLayout exposes this; mirror on Add so
+        // batch replay round-trips dumps that include it (Get emits it when the
+        // <w:cols> has w:equalWidth set).
+        if (properties.TryGetValue("columns.equalWidth", out var eqW)
+            || properties.TryGetValue("columns.equalwidth", out eqW))
+        {
+            var cols = EnsureSectPrChild<Columns>(sectPr);
+            cols.EqualWidth = IsTruthy(eqW);
+        }
 
         // Per-section margin overrides — mutate the PageMargin child of the
         // new sectPr (not the body sectPr). Margins use Int32Value for Top/
@@ -701,7 +710,8 @@ public partial class WordHandler
         bool? sStyleRtlFlag = null;
         if (properties.TryGetValue("direction", out var sDirRaw)
             || properties.TryGetValue("dir", out sDirRaw)
-            || properties.TryGetValue("bidi", out sDirRaw))
+            || properties.TryGetValue("bidi", out sDirRaw)
+            || properties.TryGetValue("rtl", out sDirRaw))
         {
             var sRtl = ParseDirectionRtl(sDirRaw);
             sStyleRtlFlag = sRtl;
@@ -729,6 +739,11 @@ public partial class WordHandler
                     }
                 }
             }
+        }
+        if (properties.TryGetValue("tabs", out var sTabsVal) || properties.TryGetValue("tabstops", out sTabsVal))
+        {
+            ApplyTabsShorthand(stylePPr, sTabsVal);
+            hasPPr = true;
         }
         if (hasPPr) newStyle.AppendChild(stylePPr);
 
@@ -875,6 +890,7 @@ public partial class WordHandler
             "direction", "dir", "bidi",
             "font.ascii", "font.hAnsi", "font.eastAsia", "font.cs",
             "numId", "numid", "ilvl", "numLevel", "numlevel",
+            "tabs", "tabstops",
         };
         foreach (var (key, value) in properties)
         {
@@ -1269,6 +1285,11 @@ public partial class WordHandler
                 levelFormatRaw = perLvlFmt;
             else if (topIsBullet)
                 levelFormatRaw = "bullet";
+            else if (properties.ContainsKey("format"))
+                // Top-level format explicitly set → propagate to every level instead of
+                // cycling through decimal/lowerLetter/lowerRoman, which silently turned
+                // `format=decimal` into mixed numbering at level 1+.
+                levelFormatRaw = topFormatRaw;
             else
                 levelFormatRaw = (lvl % 3) switch { 0 => "decimal", 1 => "lowerLetter", _ => "lowerRoman" };
             var numFmt = ParseNumberFormat(levelFormatRaw);

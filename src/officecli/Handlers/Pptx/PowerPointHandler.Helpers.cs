@@ -744,26 +744,50 @@ public partial class PowerPointHandler
         // writes a malformed transition that PowerPoint either ignores or
         // mis-renders. Mirrors the >= 0 guard on border.width / padding.
         var trimmed = (value ?? "").Trim();
-        if (trimmed.StartsWith('-'))
-            throw new ArgumentException($"Invalid advanceTime: '{value}' (must be >= 0).");
-        // ST_PositiveUniversalMeasure is bare milliseconds (integer). Reject
-        // non-numeric garbage like "later" or "5s" up front; PowerPoint
-        // silently drops the attribute on open when it fails to parse, so a
-        // malformed value used to land on disk with no error to the caller.
-        if (!int.TryParse(trimmed, System.Globalization.NumberStyles.Integer,
-                System.Globalization.CultureInfo.InvariantCulture, out _))
-            throw new ArgumentException($"Invalid advanceTime: '{value}' (expected a non-negative integer in milliseconds).");
+        // CONSISTENCY(advtime-none): help schema documents `advanceTime=none`
+        // as the timer-clear sentinel; treat it before the numeric guard so
+        // it doesn't get rejected as "non-negative integer". No-op when no
+        // transition / advTm is present (matches the spirit of unsetting).
+        var isClear = trimmed.Equals("none", StringComparison.OrdinalIgnoreCase)
+            || trimmed.Length == 0
+            || trimmed.Equals("false", StringComparison.OrdinalIgnoreCase);
+        if (!isClear)
+        {
+            if (trimmed.StartsWith('-'))
+                throw new ArgumentException($"Invalid advanceTime: '{value}' (must be >= 0).");
+            // ST_PositiveUniversalMeasure is bare milliseconds (integer). Reject
+            // non-numeric garbage like "later" or "5s" up front; PowerPoint
+            // silently drops the attribute on open when it fails to parse, so a
+            // malformed value used to land on disk with no error to the caller.
+            if (!int.TryParse(trimmed, System.Globalization.NumberStyles.Integer,
+                    System.Globalization.CultureInfo.InvariantCulture, out _))
+                throw new ArgumentException($"Invalid advanceTime: '{value}' (expected a non-negative integer in milliseconds, or 'none' to clear).");
+        }
         var acMorph = slide.ChildElements.FirstOrDefault(c =>
             c.LocalName == "AlternateContent" && c.InnerXml.Contains("morph"));
         if (acMorph != null)
         {
-            // Set advTm directly on transitions inside AlternateContent
             foreach (var trans in acMorph.Descendants().Where(d => d.LocalName == "transition"))
-                trans.SetAttribute(new OpenXmlAttribute("", "advTm", null!, value));
+            {
+                if (isClear)
+                    trans.RemoveAttribute("advTm", "");
+                else
+                    trans.SetAttribute(new OpenXmlAttribute("", "advTm", null!, trimmed));
+            }
         }
         else
         {
-            FindOrCreateTransition(slide).AdvanceAfterTime = value;
+            if (isClear)
+            {
+                // Clear advTm only if a transition already exists — don't
+                // synthesize an empty <p:transition/> just to remove the attr.
+                var existing = slide.GetFirstChild<Transition>();
+                if (existing != null) existing.AdvanceAfterTime = null;
+            }
+            else
+            {
+                FindOrCreateTransition(slide).AdvanceAfterTime = trimmed;
+            }
         }
     }
 
@@ -1109,6 +1133,17 @@ public partial class PowerPointHandler
     private static string FormatEmu(long emu) => Core.EmuConverter.FormatEmu(emu);
 
     private static string FormatLineWidth(long emu) => Core.EmuConverter.FormatLineWidth(emu);
+
+    /// <summary>
+    /// Format an EMU value as points for round-trip with bare-number Add/Set input
+    /// on PPTX paragraph indent. 12700 EMU = 1pt; output formatted with up to 2
+    /// decimals (e.g. "1pt", "0.5pt", "-12pt"). CONSISTENCY(pptx-bare-as-points).
+    /// </summary>
+    private static string FormatPptIndentPoints(long emu)
+    {
+        var pt = emu / 12700.0;
+        return pt.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture) + "pt";
+    }
 
     /// <summary>
     /// Normalize DrawingML alignment abbreviations to human-readable values.
@@ -1540,7 +1575,12 @@ public partial class PowerPointHandler
                     _ => "center"
                 };
             }
-            return $"radial:{string.Join("-", stopStrs)}-{focus}";
+            // R24 — OOXML distinguishes "path" (shape-following) from "radial"
+            // via the @path attribute. Background.cs reader already
+            // distinguishes; this helper used to flatten everything to
+            // "radial:" so dump→replay of a path gradient became a radial.
+            var prefix = pathGrad.Path?.Value == Drawing.PathShadeValues.Shape ? "path" : "radial";
+            return $"{prefix}:{string.Join("-", stopStrs)}-{focus}";
         }
 
         var linear = gradFill.GetFirstChild<Drawing.LinearGradientFill>();
@@ -1672,12 +1712,16 @@ public partial class PowerPointHandler
     // for every content element type, not just typed Shape.
     private static void ApplyZOrder(DocumentFormat.OpenXml.Packaging.SlidePart slidePart, OpenXmlElement shape, string value)
     {
-        var shapeTree = shape.Parent as ShapeTree
-            ?? throw new InvalidOperationException("Shape is not in a ShapeTree");
+        // CONSISTENCY(nested-group): a shape nested inside a GroupShape has the
+        // group as its DOM parent. ZOrder still applies within that local sibling
+        // scope — accept ShapeTree or any GroupShape container.
+        var container = shape.Parent as OpenXmlCompositeElement;
+        if (container is not ShapeTree && container is not GroupShape)
+            throw new InvalidOperationException("Shape is not in a ShapeTree or GroupShape");
 
         // Get all content elements (Shape, Picture, GraphicFrame, GroupShape, ConnectionShape)
         // that participate in z-order (skip structural elements like nvGrpSpPr, grpSpPr)
-        var contentElements = shapeTree.ChildElements
+        var contentElements = container.ChildElements
             .Where(e => e is Shape or Picture or GraphicFrame or GroupShape or ConnectionShape)
             .ToList();
         var currentIndex = contentElements.IndexOf(shape);
@@ -1716,28 +1760,28 @@ public partial class PowerPointHandler
         if (targetIndex >= contentElements.Count - 1)
         {
             // Front: append after last content element (or at end of tree)
-            shapeTree.AppendChild(shape);
+            container.AppendChild(shape);
         }
         else if (targetIndex <= 0)
         {
             // Back: insert before the first content element
-            var firstContent = shapeTree.ChildElements
+            var firstContent = container.ChildElements
                 .FirstOrDefault(e => e is Shape or Picture or GraphicFrame or GroupShape or ConnectionShape);
             if (firstContent != null)
                 firstContent.InsertBeforeSelf(shape);
             else
-                shapeTree.AppendChild(shape);
+                container.AppendChild(shape);
         }
         else
         {
             // Refresh content list after removal
-            var updatedContent = shapeTree.ChildElements
+            var updatedContent = container.ChildElements
                 .Where(e => e is Shape or Picture or GraphicFrame or GroupShape or ConnectionShape)
                 .ToList();
             if (targetIndex < updatedContent.Count)
                 updatedContent[targetIndex].InsertBeforeSelf(shape);
             else
-                shapeTree.AppendChild(shape);
+                container.AppendChild(shape);
         }
     }
 
@@ -2576,7 +2620,7 @@ public partial class PowerPointHandler
         newRun.RunProperties = rProps;
         var runText = properties.GetValueOrDefault("text", "");
         XmlTextValidator.ValidateOrThrow(runText, "text");
-        newRun.Text = new Drawing.Text { Text = OfficeCli.Core.TextEscape.Resolve(runText) };
+        newRun.Text = new Drawing.Text { Text = runText };
         return newRun;
     }
 

@@ -28,7 +28,7 @@
       "type": "string",
       "description": "start-point shape reference (Add/Set only). Accepts /slide[N]/shape[M] (positional) or /slide[N]/shape[@id=M] (as returned by 'query shape'). Reverse path resolution is not implemented.",
       "add": true, "set": true, "get": false,
-      "examples": ["--prop from=/slide[1]/shape[1]", "--prop from=/slide[1]/shape[@id=10001]"],
+      "examples": ["--prop from='/slide[1]/shape[1]'", "--prop from='/slide[1]/shape[@id=10001]'"],
       "readback": "see startShape/endShape get-only properties for resolved endpoint shape ids",
       "enforcement": "report"
     },
@@ -36,7 +36,7 @@
       "type": "string",
       "description": "end-point shape reference (Add/Set only). Accepts /slide[N]/shape[M] (positional) or /slide[N]/shape[@id=M] (as returned by 'query shape'). Reverse path resolution is not implemented.",
       "add": true, "set": true, "get": false,
-      "examples": ["--prop to=/slide[1]/shape[2]", "--prop to=/slide[1]/shape[@id=10002]"],
+      "examples": ["--prop to='/slide[1]/shape[2]'", "--prop to='/slide[1]/shape[@id=10002]'"],
       "readback": "see startShape/endShape get-only properties for resolved endpoint shape ids",
       "enforcement": "report"
     },
@@ -86,7 +86,7 @@
     "lineDash": {
       "type": "enum",
       "values": ["solid", "dot", "dash", "dashDot", "lgDash", "lgDashDot", "lgDashDotDot", "sysDot", "sysDash", "sysDashDot", "sysDashDotDot", "longdash", "longdashdot"],
-      "description": "outline dash pattern (drawingML prstDash). Get readback emits the canonical OOXML token (lgDash/lgDashDot/lgDashDotDot/sysDot/...); the long* aliases are accepted on Add/Set only.",
+      "description": "outline dash pattern (drawingML prstDash). Get readback emits the canonical OOXML token (lgDash/lgDashDot/lgDashDotDot/sysDot/...); the long* aliases are accepted on Add/Set only. 'dashDotDot' has no native enum member; it is accepted as an alias for sysDashDotDot (Get readback returns sysDashDotDot).",
       "add": true, "set": true, "get": true,
       "aliases": ["linedash"],
       "examples": ["--prop lineDash=dash", "--prop lineDash=lgDash", "--prop lineDash=sysDash"],

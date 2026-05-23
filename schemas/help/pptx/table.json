@@ -19,7 +19,7 @@
       "/slide[N]/table[M]"
     ]
   },
-  "note": "A table is a GraphicFrame wrapping a Drawing.Table. Data can be seeded inline via 'data' (semicolon-separated rows, comma-separated cells) or per-cell via 'r{R}c{C}' props. Dimensions in EMU-parseable length (1in/2cm/raw EMU/720pt).",
+  "note": "GraphicFrame wrapping Drawing.Table. Seed data inline via `data` (semicolons split rows, commas split cells) or per-cell via `r{R}c{C}` props. `get /slide[N]/table[K]` defaults to --depth=1 (table + row stubs only; large tables at depth=2 dominate the response). Use --depth 2 or address cells directly via `/slide[N]/table[K]/row[R]/cell[C]`.",
   "children": [
     {
       "element": "row",
@@ -45,6 +45,17 @@
       "get": true,
       "description": "OOXML graphic frame id (cNvPr id). pptx-only readback.",
       "readback": "integer (cNvPr graphic frame id)",
+      "enforcement": "report"
+    },
+    "zorder": {
+      "type": "number",
+      "description": "1-based z-order in slide shape tree. On add, positions the table within the shape tree (1 = back). Post-creation reordering is not supported via Set; use Move/Swap on the table graphic frame, or raw-set the spTree child order.",
+      "aliases": ["z-order", "order"],
+      "add": true,
+      "set": false,
+      "get": true,
+      "examples": ["--prop zorder=1"],
+      "readback": "1-based integer (1 = back)",
       "enforcement": "report"
     },
     "x": {
@@ -94,6 +105,22 @@
         "--prop rowHeight=1cm"
       ],
       "readback": "not surfaced at table level",
+      "enforcement": "strict"
+    },
+    "colWidths": {
+      "type": "string",
+      "description": "per-column widths as comma- or semicolon-separated lengths (EMU/cm/in/pt). Length must match 'cols'; extra/missing entries fall back to the uniform default. Get readback is comma-separated FormatEmu output.",
+      "aliases": [
+        "colwidths"
+      ],
+      "add": true,
+      "set": false,
+      "get": true,
+      "examples": [
+        "--prop colWidths=2cm,3cm,2cm",
+        "--prop colWidths=\"1in;2in;1in\""
+      ],
+      "readback": "comma-separated length list (e.g. \"2cm,3cm,2cm\")",
       "enforcement": "strict"
     },
     "headerFill": {

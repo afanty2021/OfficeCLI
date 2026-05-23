@@ -57,6 +57,35 @@ internal static partial class ChartHelper
         var axisTitle = axis.GetFirstChild<C.Title>();
         var axisTitleText = axisTitle?.Descendants<Drawing.Text>().FirstOrDefault()?.Text;
         if (axisTitleText != null) node.Format["title"] = axisTitleText;
+        // CONSISTENCY(axis-title-styling): mirror the Set surface — when callers
+        // can write title.font/color/size on the axis Set path, they must also
+        // be able to read them back on the axis Get. Pull from the first run's
+        // rPr (and fall back to defRPr) so the readback matches what was set.
+        if (axisTitle != null)
+        {
+            var firstAxisTitleRun = axisTitle.Descendants<Drawing.Run>().FirstOrDefault();
+            var firstAxisRPr = firstAxisTitleRun?.RunProperties;
+            var axisDefRPr = axisTitle.Descendants<Drawing.DefaultRunProperties>().FirstOrDefault();
+
+            var atFont = firstAxisRPr?.GetFirstChild<Drawing.LatinFont>()?.Typeface?.Value
+                ?? axisDefRPr?.GetFirstChild<Drawing.LatinFont>()?.Typeface?.Value;
+            if (!string.IsNullOrEmpty(atFont)) node.Format["title.font"] = atFont;
+
+            var atSize = firstAxisRPr?.FontSize?.Value ?? axisDefRPr?.FontSize?.Value;
+            if (atSize.HasValue)
+                node.Format["title.size"] = $"{atSize.Value / 100.0:0.##}pt";
+
+            var atBold = firstAxisRPr?.Bold?.Value ?? axisDefRPr?.Bold?.Value;
+            if (atBold == true) node.Format["title.bold"] = "true";
+
+            // Color from rPr's solidFill (or defRPr's). Mirror ParseHelpers
+            // canonical "#RRGGBB" used elsewhere in chart readback.
+            var atSolid = firstAxisRPr?.GetFirstChild<Drawing.SolidFill>()
+                ?? axisDefRPr?.GetFirstChild<Drawing.SolidFill>();
+            var atRgbEl = atSolid?.GetFirstChild<Drawing.RgbColorModelHex>();
+            if (atRgbEl?.Val?.Value is { } atRgb && !string.IsNullOrEmpty(atRgb))
+                node.Format["title.color"] = ParseHelpers.FormatHexColor(atRgb);
+        }
 
         // Visible: true unless C.Delete is set truthy
         var deleteEl = axis.GetFirstChild<C.Delete>();
@@ -164,6 +193,7 @@ internal static partial class ChartHelper
         var normalizedRole = role.ToLowerInvariant();
         var translated = new Dictionary<string, string>();
         var directlyHandled = new List<string>();
+        var pendingAxisTitleStyling = new Dictionary<string, string>(System.StringComparer.OrdinalIgnoreCase);
 
         // Resolve target axis once for direct-apply paths.
         var chart = chartPart.ChartSpace?.GetFirstChild<C.Chart>();
@@ -439,7 +469,16 @@ internal static partial class ChartHelper
                             "midcat" or "midpoint" => C.CrossBetweenValues.MidpointCategory,
                             _ => C.CrossBetweenValues.Between
                         };
-                        axCb.AppendChild(new C.CrossBetween { Val = cbVal });
+                        // CT_ValAx schema: ..., crossAx, crosses?, crossesAt?,
+                        // crossBetween?, majorUnit?, minorUnit?, dispUnits?, extLst?.
+                        // AppendChild lands it after majorUnit which PowerPoint
+                        // rejects ("unexpected child element 'crossBetween'").
+                        var cb = new C.CrossBetween { Val = cbVal };
+                        var cbAnchor = axCb.GetFirstChild<C.CrossesAt>() as OpenXmlElement
+                            ?? axCb.GetFirstChild<C.Crosses>() as OpenXmlElement
+                            ?? axCb.GetFirstChild<C.CrossingAxis>() as OpenXmlElement;
+                        if (cbAnchor != null) cbAnchor.InsertAfterSelf(cb);
+                        else axCb.AppendChild(cb);
                     }
                     directlyHandled.Add(key);
                     break;
@@ -462,6 +501,40 @@ internal static partial class ChartHelper
                                             value.Equals("maxmin", StringComparison.OrdinalIgnoreCase)
                                 ? C.OrientationValues.MaxMin : C.OrientationValues.MinMax;
                             scaling.PrependChild(new C.Orientation { Val = orientVal });
+                        }
+                    }
+                    directlyHandled.Add(key);
+                    break;
+                }
+
+                case "majorunit":
+                case "minorunit":
+                {
+                    // Schema: majorUnit / minorUnit only valid on value/value2.
+                    // Without this direct-apply branch the role-scoped Set on
+                    // role=value2 falls through to the chart-level case which
+                    // always grabs the primary ValueAxis, so the secondary
+                    // axis silently retained its old tick interval.
+                    if (normalizedRole is not ("value" or "value2"))
+                    {
+                        directlyHandled.Add(key);
+                        break;
+                    }
+                    if (targetAxis is OpenXmlCompositeElement axMu)
+                    {
+                        var unit = ParseHelpers.SafeParseDouble(value, lower);
+                        if (!(unit > 0))
+                            throw new ArgumentException(
+                                $"Invalid {lower} '{value}': must be a positive number (OOXML ST_AxisUnit > 0).");
+                        if (lower == "majorunit")
+                        {
+                            axMu.RemoveAllChildren<C.MajorUnit>();
+                            InsertValAxChildInOrder(axMu, new C.MajorUnit { Val = unit });
+                        }
+                        else
+                        {
+                            axMu.RemoveAllChildren<C.MinorUnit>();
+                            InsertValAxChildInOrder(axMu, new C.MinorUnit { Val = unit });
                         }
                     }
                     directlyHandled.Add(key);
@@ -504,6 +577,21 @@ internal static partial class ChartHelper
                     break;
                 }
 
+                case "title.font" or "titlefont":
+                case "title.size" or "titlesize":
+                case "title.color" or "titlecolor":
+                case "title.bold" or "titlebold":
+                    // CONSISTENCY(axis-title-styling): these used to fall to default
+                    // and forward to the chart-level title handler, which then
+                    // mutated the wrong title (or returned UNSUPPORTED when no
+                    // chart title existed). Buffer them here and apply AFTER the
+                    // translated forward — that's where `axisTitle=…` / `title=…`
+                    // creates the C.Title on this axis, so we need to operate on
+                    // the post-forward DOM.
+                    pendingAxisTitleStyling[lower] = value;
+                    directlyHandled.Add(key);
+                    break;
+
                 default:
                     // Forward unknown keys verbatim; SetChartProperties will flag them as unsupported.
                     translated[key] = value;
@@ -514,6 +602,68 @@ internal static partial class ChartHelper
         var unsupported = translated.Count > 0
             ? SetChartProperties(chartPart, translated)
             : new List<string>();
+
+        // Apply axis-scoped title styling AFTER the chart-level setter has
+        // had a chance to create/replace the C.Title (axistitle / cattitle
+        // build a fresh title from scratch). Re-resolve targetAxis since the
+        // forward may have mutated the plotArea.
+        if (pendingAxisTitleStyling.Count > 0)
+        {
+            var axisAfter = plotArea != null ? FindAxisByRole(plotArea, normalizedRole) : null;
+            var axisTitle = (axisAfter as OpenXmlCompositeElement)?.GetFirstChild<C.Title>();
+            foreach (var (axKey, axVal) in pendingAxisTitleStyling)
+            {
+                if (axisTitle == null) { unsupported.Add(axKey); continue; }
+                var norm = axKey.Replace("title.", "").Replace("title", "");
+                foreach (var run in axisTitle.Descendants<Drawing.Run>())
+                {
+                    var rPr = run.RunProperties ?? (run.RunProperties = new Drawing.RunProperties());
+                    switch (norm)
+                    {
+                        case "font":
+                            rPr.RemoveAllChildren<Drawing.LatinFont>();
+                            rPr.RemoveAllChildren<Drawing.EastAsianFont>();
+                            rPr.AppendChild(new Drawing.LatinFont { Typeface = axVal });
+                            rPr.AppendChild(new Drawing.EastAsianFont { Typeface = axVal });
+                            break;
+                        case "size":
+                            var sizeStr = axVal.EndsWith("pt", System.StringComparison.OrdinalIgnoreCase)
+                                ? axVal[..^2] : axVal;
+                            rPr.FontSize = (int)System.Math.Round(
+                                ParseHelpers.SafeParseDouble(sizeStr, "title.size") * 100);
+                            break;
+                        case "color":
+                        {
+                            rPr.RemoveAllChildren<Drawing.SolidFill>();
+                            var (rgb, _) = ParseHelpers.SanitizeColorForOoxml(axVal);
+                            DrawingEffectsHelper.InsertFillInRunProperties(rPr,
+                                new Drawing.SolidFill(new Drawing.RgbColorModelHex { Val = rgb }));
+                            break;
+                        }
+                        case "bold":
+                            rPr.Bold = ParseHelpers.IsTruthy(axVal);
+                            break;
+                    }
+                }
+                // Mirror chart-Setter behavior — keep defRPr in sync for size/bold.
+                var defRp = axisTitle.Descendants<Drawing.DefaultRunProperties>().FirstOrDefault();
+                if (defRp != null)
+                {
+                    switch (norm)
+                    {
+                        case "size":
+                            var sizeStr = axVal.EndsWith("pt", System.StringComparison.OrdinalIgnoreCase)
+                                ? axVal[..^2] : axVal;
+                            defRp.FontSize = (int)System.Math.Round(
+                                ParseHelpers.SafeParseDouble(sizeStr, "title.size") * 100);
+                            break;
+                        case "bold":
+                            defRp.Bold = ParseHelpers.IsTruthy(axVal);
+                            break;
+                    }
+                }
+            }
+        }
         // directlyHandled keys are already applied; do not surface as unsupported.
         return unsupported;
     }

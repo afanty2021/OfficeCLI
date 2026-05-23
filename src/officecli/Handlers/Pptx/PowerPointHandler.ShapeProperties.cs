@@ -236,10 +236,9 @@ public partial class PowerPointHandler
                 case "text":
                 {
                     XmlTextValidator.ValidateOrThrow(value, "text");
-                    // CONSISTENCY(escape-sequences): \n splits paragraphs, \t
-                    // becomes <a:tab/> paragraph children between text runs.
-                    var resolved = OfficeCli.Core.TextEscape.Resolve(value);
-                    var textLines = resolved.Split('\n');
+                    // CONSISTENCY(text-escape-boundary): \n / \t resolution at
+                    // CLI --prop parse; here value has real newlines/tabs.
+                    var textLines = value.Split('\n');
                     if (runs.Count == 1 && textLines.Length == 1 && !textLines[0].Contains('\t'))
                     {
                         // Single run, single line, no tabs: just replace text
@@ -408,7 +407,7 @@ public partial class PowerPointHandler
                     foreach (var run in runs)
                     {
                         var rProps = run.RunProperties ?? (run.RunProperties = new Drawing.RunProperties());
-                        rProps.Underline = value.ToLowerInvariant() switch
+                        var ulMapped = value.ToLowerInvariant() switch
                         {
                             "true" or "single" or "sng" => Drawing.TextUnderlineValues.Single,
                             "double" or "dbl" => Drawing.TextUnderlineValues.Double,
@@ -419,8 +418,44 @@ public partial class PowerPointHandler
                             "false" or "none" => Drawing.TextUnderlineValues.None,
                             _ => throw new ArgumentException($"Invalid underline value: '{value}'. Valid values: single, double, heavy, dotted, dash, wavy, none.")
                         };
+                        rProps.Underline = ulMapped;
+                        // When the user clears the underline (none/false), any
+                        // previously-attached uFill / uFillTx children describe
+                        // the colour of a stroke that no longer exists. Leave
+                        // them in place and PowerPoint silently renders the
+                        // run as underlined again on next open. Strip them so
+                        // "underline=none" actually means "no underline".
+                        if (ulMapped == Drawing.TextUnderlineValues.None)
+                        {
+                            rProps.RemoveAllChildren<Drawing.UnderlineFill>();
+                            rProps.RemoveAllChildren<Drawing.UnderlineFillText>();
+                        }
                     }
                     break;
+
+                case "underlineColor":
+                case "underlinecolor":
+                case "underline.color":
+                case "font.underline.color":
+                {
+                    // DrawingML: <a:uFill><a:solidFill><a:srgbClr val="…"/></a:solidFill></a:uFill>
+                    // Sits between a:uLn and a:latin in CT_TextCharacterProperties
+                    // (schema order bucket 6 — see DrawingRunPropChildOrder).
+                    // ReorderDrawingRunProperties at the end of this method's
+                    // existing post-set cleanup keeps the element in order.
+                    var ulHex = ParseHelpers.SanitizeColorForOoxml(value).Rgb;
+                    foreach (var run in runs)
+                    {
+                        var rProps = run.RunProperties ?? (run.RunProperties = new Drawing.RunProperties());
+                        rProps.RemoveAllChildren<Drawing.UnderlineFill>();
+                        rProps.RemoveAllChildren<Drawing.UnderlineFillText>();
+                        var uFill = new Drawing.UnderlineFill(
+                            new Drawing.SolidFill(new Drawing.RgbColorModelHex { Val = ulHex }));
+                        rProps.AppendChild(uFill);
+                        ReorderDrawingRunProperties(rProps);
+                    }
+                    break;
+                }
 
                 case "strikethrough" or "strike" or "font.strike" or "font.strikethrough":
                     foreach (var run in runs)
@@ -532,6 +567,27 @@ public partial class PowerPointHandler
                     bool rtl = key.ToLowerInvariant() == "rtl"
                         ? IsTruthy(value)
                         : ParsePptDirectionRtl(value);
+                    // CONSISTENCY(run-context-explicit): when the caller targeted
+                    // a run path, write <a:rPr rtl="1"/> on the run only and
+                    // leave pPr/bodyPr alone. Mirrors the shadow/glow/reflection
+                    // run-context branches and matches the OOXML schema, which
+                    // allows the rtl attribute on CT_TextCharacterProperties too.
+                    if (runContext && runs.Count > 0)
+                    {
+                        foreach (var run in runs)
+                        {
+                            var rProps = run.RunProperties ?? (run.RunProperties = new Drawing.RunProperties());
+                            // Drawing.RunProperties does not expose `rtl` as a
+                            // typed property even though CT_TextCharacterProperties
+                            // declares it; set the raw attribute (unqualified ns
+                            // matches DrawingML's <a:rPr rtl="1"/>).
+                            if (rtl)
+                                rProps.SetAttribute(new DocumentFormat.OpenXml.OpenXmlAttribute("", "rtl", "", "1"));
+                            else
+                                rProps.RemoveAttribute("rtl", "");
+                        }
+                        break;
+                    }
                     foreach (var para in shape.TextBody?.Elements<Drawing.Paragraph>() ?? Enumerable.Empty<Drawing.Paragraph>())
                     {
                         var pProps = para.ParagraphProperties ?? (para.ParagraphProperties = new Drawing.ParagraphProperties());
@@ -571,6 +627,26 @@ public partial class PowerPointHandler
                         "center" or "middle" or "c" or "m" => Drawing.TextAnchoringTypeValues.Center,
                         "bottom" or "b" => Drawing.TextAnchoringTypeValues.Bottom,
                         _ => throw new ArgumentException($"Invalid valign: {value}. Use top/center/bottom")
+                    };
+                    break;
+                }
+
+                case "textdirection" or "textdir":
+                {
+                    // CONSISTENCY(textdir-shape): <a:bodyPr vert="…"/> is valid
+                    // on shapes/textboxes, not just table cells. Mirrors the cell
+                    // helper's textdirection case (Set.Table cell context) so the
+                    // same vocabulary works at the shape surface.
+                    var bodyPr = shape.TextBody?.Elements<Drawing.BodyProperties>().FirstOrDefault();
+                    if (bodyPr == null) { unsupported.Add(key); break; }
+                    bodyPr.Vertical = value.ToLowerInvariant() switch
+                    {
+                        "horizontal" or "horz" or "none" => Drawing.TextVerticalValues.Horizontal,
+                        "vertical" or "vert" or "vert270" => Drawing.TextVerticalValues.Vertical270,
+                        "vertical270" => Drawing.TextVerticalValues.Vertical270,
+                        "vertical90" or "vert90" => Drawing.TextVerticalValues.Vertical,
+                        "stacked" or "wordartvert" => Drawing.TextVerticalValues.WordArtVertical,
+                        _ => throw new ArgumentException($"Invalid textDirection: '{value}'. Valid: horizontal, vertical, vertical90, vertical270, stacked.")
                     };
                     break;
                 }
@@ -678,6 +754,30 @@ public partial class PowerPointHandler
                     if (spPr == null) { unsupported.Add(key); break; }
                     var outline = EnsureOutline(spPr);
                     outline.Width = Core.EmuConverter.ParseLineWidth(value);
+                    break;
+                }
+
+                case "line.gradient" or "linegradient":
+                {
+                    // Gradient stroke. Reader emits this for any <a:ln> whose
+                    // child is GradientFill; without a setter the round trip
+                    // dropped the gradient and replayed as a bare <a:ln/>
+                    // (theme thin black stroke). Use the same gradient-spec
+                    // grammar the shape fill accepts ("color1-color2[:angle]"
+                    // or full multi-stop form).
+                    var spPr = shape.ShapeProperties;
+                    if (spPr == null) { unsupported.Add(key); break; }
+                    var outline = EnsureOutline(spPr);
+                    outline.RemoveAllChildren<Drawing.SolidFill>();
+                    outline.RemoveAllChildren<Drawing.NoFill>();
+                    outline.RemoveAllChildren<Drawing.GradientFill>();
+                    var grad = BuildGradientFill(value);
+                    // CT_LineProperties schema: fill (solidFill/noFill/gradFill/pattFill) → prstDash → ...
+                    var prstDashAnchor = outline.GetFirstChild<Drawing.PresetDash>();
+                    if (prstDashAnchor != null)
+                        outline.InsertBefore(grad, prstDashAnchor);
+                    else
+                        outline.PrependChild(grad);
                     break;
                 }
 
@@ -928,7 +1028,8 @@ public partial class PowerPointHandler
 
                 case "indent":
                 {
-                    var indentEmu = (int)ParseEmu(value);
+                    // CONSISTENCY(pptx-bare-as-points): mirror AddParagraph / Set.Shape.
+                    var indentEmu = (int)Math.Round(SpacingConverter.ParsePointsSigned(value) * 12700.0);
                     foreach (var para in shape.TextBody?.Elements<Drawing.Paragraph>() ?? Enumerable.Empty<Drawing.Paragraph>())
                     {
                         var pProps = para.ParagraphProperties ?? (para.ParagraphProperties = new Drawing.ParagraphProperties());
@@ -939,7 +1040,8 @@ public partial class PowerPointHandler
 
                 case "marginleft" or "marl":
                 {
-                    var mlEmu = (int)ParseEmu(value);
+                    // CONSISTENCY(pptx-bare-as-points): mirror AddParagraph / Set.Shape.
+                    var mlEmu = (int)Math.Round(SpacingConverter.ParsePointsSigned(value) * 12700.0);
                     foreach (var para in shape.TextBody?.Elements<Drawing.Paragraph>() ?? Enumerable.Empty<Drawing.Paragraph>())
                     {
                         var pProps = para.ParagraphProperties ?? (para.ParagraphProperties = new Drawing.ParagraphProperties());
@@ -950,7 +1052,7 @@ public partial class PowerPointHandler
 
                 case "marginright" or "marr":
                 {
-                    var mrEmu = (int)ParseEmu(value);
+                    var mrEmu = (int)Math.Round(SpacingConverter.ParsePointsSigned(value) * 12700.0);
                     foreach (var para in shape.TextBody?.Elements<Drawing.Paragraph>() ?? Enumerable.Empty<Drawing.Paragraph>())
                     {
                         var pProps = para.ParagraphProperties ?? (para.ParagraphProperties = new Drawing.ParagraphProperties());
@@ -1073,7 +1175,14 @@ public partial class PowerPointHandler
                     if (spPr == null) { unsupported.Add(key); break; }
                     var shadowVal = value;
                     if (IsValidBooleanString(shadowVal) && IsTruthy(shadowVal)) shadowVal = "000000";
-                    if (IsNoFillShape(spPr) && runs.Count > 0)
+                    // CONSISTENCY(run-context-explicit): when the caller explicitly
+                    // targeted a run path, write to the run's <a:rPr><a:effectLst>
+                    // unconditionally. The IsNoFillShape heuristic only makes sense
+                    // for whole-shape Set; an explicit run-path Set must not be
+                    // hijacked to the shape level when the shape has a fill.
+                    if (runContext && runs.Count > 0)
+                        foreach (var run in runs) ApplyTextShadow(run, shadowVal);
+                    else if (IsNoFillShape(spPr) && runs.Count > 0)
                         foreach (var run in runs) ApplyTextShadow(run, shadowVal);
                     else
                         ApplyShadow(spPr, shadowVal);
@@ -1086,7 +1195,10 @@ public partial class PowerPointHandler
                     if (spPr == null) { unsupported.Add(key); break; }
                     var glowVal = value;
                     if (IsValidBooleanString(glowVal) && IsTruthy(glowVal)) glowVal = "4472C4";
-                    if (IsNoFillShape(spPr) && runs.Count > 0)
+                    // CONSISTENCY(run-context-explicit): see shadow case above.
+                    if (runContext && runs.Count > 0)
+                        foreach (var run in runs) ApplyTextGlow(run, glowVal);
+                    else if (IsNoFillShape(spPr) && runs.Count > 0)
                         foreach (var run in runs) ApplyTextGlow(run, glowVal);
                     else
                         ApplyGlow(spPr, glowVal);
@@ -1097,7 +1209,10 @@ public partial class PowerPointHandler
                 {
                     var spPr = shape.ShapeProperties;
                     if (spPr == null) { unsupported.Add(key); break; }
-                    if (IsNoFillShape(spPr) && runs.Count > 0)
+                    // CONSISTENCY(run-context-explicit): see shadow case above.
+                    if (runContext && runs.Count > 0)
+                        foreach (var run in runs) ApplyTextReflection(run, value);
+                    else if (IsNoFillShape(spPr) && runs.Count > 0)
                         foreach (var run in runs) ApplyTextReflection(run, value);
                     else
                         ApplyReflection(spPr, value);
@@ -1108,7 +1223,10 @@ public partial class PowerPointHandler
                 {
                     var spPr = shape.ShapeProperties;
                     if (spPr == null) { unsupported.Add(key); break; }
-                    if (IsNoFillShape(spPr) && runs.Count > 0)
+                    // CONSISTENCY(run-context-explicit): see shadow case above.
+                    if (runContext && runs.Count > 0)
+                        foreach (var run in runs) ApplyTextSoftEdge(run, value);
+                    else if (IsNoFillShape(spPr) && runs.Count > 0)
                         foreach (var run in runs) ApplyTextSoftEdge(run, value);
                     else
                         ApplySoftEdge(spPr, value);
@@ -1474,9 +1592,8 @@ public partial class PowerPointHandler
                 {
                     XmlTextValidator.ValidateOrThrow(value, "text");
                     var textBody = cell.TextBody;
-                    // CONSISTENCY(escape-sequences): \n -> paragraph split,
-                    // \t -> <a:tab/> between runs.
-                    var lines = OfficeCli.Core.TextEscape.Resolve(value).Split('\n');
+                    // CONSISTENCY(text-escape-boundary): see CommandBuilder.
+                    var lines = value.Split('\n');
                     if (textBody == null)
                     {
                         textBody = new Drawing.TextBody(
@@ -1823,32 +1940,42 @@ public partial class PowerPointHandler
                     }
                     break;
                 }
-                case "vmerge":
-                    cell.VerticalMerge = new DocumentFormat.OpenXml.BooleanValue(IsTruthy(value));
-                    break;
-                case "hmerge":
-                    cell.HorizontalMerge = new DocumentFormat.OpenXml.BooleanValue(IsTruthy(value));
-                    break;
+                // vmerge / hmerge are get-only per schema (set=false). Removed
+                // from Set so the key falls through to default → unsupported
+                // warning + exit 2, matching schema intent. Without this, the
+                // case consumed the key and called IsTruthy() which threw on
+                // non-boolean inputs like "restart" (R7 minor-2). Users
+                // wanting to merge should use merge.down=N / merge.right=N.
                 case "merge.right":
                 {
-                    // Convenience: merge.right=N sets gridSpan on this cell and hMerge on next N cells
+                    // Convenience: merge.right=N sets gridSpan on this cell and hMerge on next N cells.
+                    // CONSISTENCY(merge-clamp): clamp gridSpan to the cells that
+                    // actually exist on this row so a high `merge.right=N` can't
+                    // produce a corrupt file (PowerPoint silently misrenders
+                    // gridSpan values that exceed the row's cell count).
                     var span = ParseHelpers.SafeParseInt(value, "merge.right") + 1;
-                    cell.GridSpan = new DocumentFormat.OpenXml.Int32Value(span);
                     var row = cell.Parent as Drawing.TableRow;
                     if (row != null)
                     {
                         var cells = row.Elements<Drawing.TableCell>().ToList();
                         var idx = cells.IndexOf(cell);
+                        span = System.Math.Max(1, System.Math.Min(span, cells.Count - idx));
+                        cell.GridSpan = new DocumentFormat.OpenXml.Int32Value(span);
                         for (int mi = idx + 1; mi < idx + span && mi < cells.Count; mi++)
                             cells[mi].HorizontalMerge = new DocumentFormat.OpenXml.BooleanValue(true);
+                    }
+                    else
+                    {
+                        cell.GridSpan = new DocumentFormat.OpenXml.Int32Value(System.Math.Max(1, span));
                     }
                     break;
                 }
                 case "merge.down":
                 {
-                    // Convenience: merge.down=N sets rowSpan on this cell and vMerge on cells below
+                    // Convenience: merge.down=N sets rowSpan on this cell and vMerge on cells below.
+                    // CONSISTENCY(merge-clamp): mirror the merge.right clamp so
+                    // rowSpan never exceeds (rowCount - rowIdx).
                     var rSpan = ParseHelpers.SafeParseInt(value, "merge.down") + 1;
-                    cell.RowSpan = new DocumentFormat.OpenXml.Int32Value(rSpan);
                     var row = cell.Parent as Drawing.TableRow;
                     var table = row?.Parent;
                     if (table != null && row != null)
@@ -1857,12 +1984,18 @@ public partial class PowerPointHandler
                         var rowIdx = rows.IndexOf(row);
                         var cells = row.Elements<Drawing.TableCell>().ToList();
                         var colIdx = cells.IndexOf(cell);
+                        rSpan = System.Math.Max(1, System.Math.Min(rSpan, rows.Count - rowIdx));
+                        cell.RowSpan = new DocumentFormat.OpenXml.Int32Value(rSpan);
                         for (int ri = rowIdx + 1; ri < rowIdx + rSpan && ri < rows.Count; ri++)
                         {
                             var belowCells = rows[ri].Elements<Drawing.TableCell>().ToList();
                             if (colIdx < belowCells.Count)
                                 belowCells[colIdx].VerticalMerge = new DocumentFormat.OpenXml.BooleanValue(true);
                         }
+                    }
+                    else
+                    {
+                        cell.RowSpan = new DocumentFormat.OpenXml.Int32Value(System.Math.Max(1, rSpan));
                     }
                     break;
                 }
@@ -1885,6 +2018,25 @@ public partial class PowerPointHandler
                         };
                     }
                     break;
+                case "underlineColor":
+                case "underlinecolor":
+                case "underline.color":
+                case "font.underline.color":
+                {
+                    EnsureTableCellHasRun(cell);
+                    var ulHex = ParseHelpers.SanitizeColorForOoxml(value).Rgb;
+                    foreach (var run in cell.Descendants<Drawing.Run>())
+                    {
+                        var rProps = run.RunProperties ?? (run.RunProperties = new Drawing.RunProperties());
+                        rProps.RemoveAllChildren<Drawing.UnderlineFill>();
+                        rProps.RemoveAllChildren<Drawing.UnderlineFillText>();
+                        var uFill = new Drawing.UnderlineFill(
+                            new Drawing.SolidFill(new Drawing.RgbColorModelHex { Val = ulHex }));
+                        rProps.AppendChild(uFill);
+                        ReorderDrawingRunProperties(rProps);
+                    }
+                    break;
+                }
                 case "strikethrough" or "strike" or "font.strike" or "font.strikethrough":
                     EnsureTableCellHasRun(cell);
                     foreach (var run in cell.Descendants<Drawing.Run>())
@@ -2530,7 +2682,7 @@ public partial class PowerPointHandler
         // CONSISTENCY(escape-sequences): both \n and \t are interpreted in text=
         // properties cross-handler; resolve here so width estimation matches what
         // PowerPoint will actually render.
-        var textLines = OfficeCli.Core.TextEscape.Resolve(text).Split('\n');
+        var textLines = text.Split('\n');
         int totalLines = 0;
         foreach (var line in textLines)
         {

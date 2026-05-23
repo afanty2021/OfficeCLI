@@ -16,9 +16,9 @@ static partial class CommandBuilder
         var dumpPathArg = new Argument<string>("path")
         {
             Description = "DOM path of the subtree to dump. Defaults to '/' (whole document) when omitted. "
-                        + "Supported docx subtree paths: /body, /body/p[N], /body/tbl[N], /theme, /settings, /numbering, /styles. "
-                        + "Supported pptx subtree paths: /, /slide[N]. "
-                        + "Subtree dumps do NOT include resources at sibling paths (styles/numbering/theme); replay target must already define referenced styles/numIds.",
+                        + "Supported docx subtree paths: /, /body, /body/p[N], /body/tbl[N], /theme, /settings, /numbering, /styles. "
+                        + "Supported pptx subtree paths: /, /presentation, /slide[N], /theme, /notesMaster, /slideMaster[N], /slideLayout[N], /noteSlide[N]. "
+                        + "Subtree dumps do NOT include resources at sibling paths (styles/numbering/theme; pptx: master/layout/theme); replay target must already define referenced styles/numIds/layouts.",
             DefaultValueFactory = _ => "/"
         };
         var formatOpt = new Option<string>("--format")
@@ -80,14 +80,22 @@ static partial class CommandBuilder
             // CONSISTENCY(dump-format-dispatch): mirrors docx vs pptx branch
             List<BatchItem> items;
             List<CliWarning>? dumpWarnings = null;
+            // BUG-R4-01: route open through DocumentHandlerFactory so the
+            // FileFormatException / OpenXmlPackageException → CliException
+            // (code=corrupt_file) wrapping applies. Without this, direct
+            // `new WordHandler(...)` / `new PowerPointHandler(...)` leaks the
+            // raw OOXML SDK exception out of programmatic callers (tests,
+            // resident batch) — SafeRun catches it at the CLI surface but
+            // any in-process consumer sees the unwrapped form.
+            using var handler = DocumentHandlerFactory.Open(file.FullName, editable: false);
             if (ext == ".docx")
             {
-                using var word = new WordHandler(file.FullName, editable: false);
+                var word = (WordHandler)handler;
                 items = WordBatchEmitter.EmitWord(word, path);
             }
             else // .pptx
             {
-                using var ppt = new PowerPointHandler(file.FullName, editable: false);
+                var ppt = (PowerPointHandler)handler;
                 var (pItems, pWarnings) = PptxBatchEmitter.EmitPptx(ppt, path);
                 items = pItems;
                 if (pWarnings.Count > 0)
@@ -127,7 +135,12 @@ static partial class CommandBuilder
                 // JSON array) so it can feed `batch --input <file>`
                 // unchanged — wrapping it in an envelope would break
                 // batch consumption.
-                File.WriteAllText(outPath, output);
+                // CONSISTENCY(trailing-newline): stdout always ends with a
+                // newline (Console.WriteLine); pair it on the file form too
+                // so tools like `wc -l`, `git diff`, POSIX text-file
+                // expectations and pipe-vs-file consumers agree on the
+                // payload shape.
+                File.WriteAllText(outPath, output + "\n");
                 if (json)
                 {
                     // BUG-R6-01: previously stdout returned

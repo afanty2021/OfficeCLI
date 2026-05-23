@@ -5,7 +5,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <RootNamespace>OfficeCli</RootNamespace>
     <AssemblyName>officecli</AssemblyName>
-    <Version>1.0.94</Version>
+    <Version>1.0.96</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
@@ -34,6 +34,9 @@
     </EmbeddedResource>
     <EmbeddedResource Include="Resources/chartex-colors.xml" />
     <EmbeddedResource Include="Resources/chartex-style.xml" />
+    <EmbeddedResource Include="Handlers/Pptx/EffectTemplates/*.xml">
+      <LogicalName>OfficeCli.Handlers.Pptx.EffectTemplates.%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
   </ItemGroup>
 
   <ItemGroup>
@@ -41,10 +44,6 @@
          so SkillInstaller's `skills/{folder}/…` prefix lookup works on all platforms. -->
     <EmbeddedResource Include="../../skills/**/*" LogicalName="skills/$([System.String]::Copy('%(RecursiveDir)').Replace('\','/'))%(Filename)%(Extension)" />
     <EmbeddedResource Remove="../../skills/**/*.glb" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <EmbeddedResource Include="../../SKILL.md" LogicalName="OfficeCli.Resources.skill-officecli.md" />
   </ItemGroup>
 
   <!-- Embed help schemas into the assembly so SchemaHelpLoader can read

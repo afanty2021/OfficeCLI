@@ -4,6 +4,7 @@
 using DocumentFormat.OpenXml;
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Presentation;
+using OfficeCli.Core;
 using Drawing = DocumentFormat.OpenXml.Drawing;
 
 namespace OfficeCli.Handlers;
@@ -17,14 +18,37 @@ public partial class PowerPointHandler
     // composite animValue parser's silent fallback + stderr warning.
 
     private static readonly HashSet<string> _animClassValues =
-        new(StringComparer.OrdinalIgnoreCase) { "entrance", "exit", "emphasis" };
+        new(StringComparer.OrdinalIgnoreCase) { "entrance", "exit", "emphasis", "motion" };
+
+    // PowerPoint 2013+ "Exciting" / "Dynamic Content" transitions stored as
+    // <p15:prstTrans prst="..."/>. CLI key is the lowerCamelCase OOXML token;
+    // value is what gets written to the @prst attribute. Lookup is
+    // OrdinalIgnoreCase so `transition=PageCurlDouble` and `pagecurldouble`
+    // both reach the same code path.
+    private static readonly Dictionary<string, string> _p15PrstTokens =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["box"] = "box",
+            ["fallOver"] = "fallOver",
+            ["drape"] = "drape",
+            ["curtains"] = "curtains",
+            ["wind"] = "wind",
+            ["prestige"] = "prestige",
+            ["fracture"] = "fracture",
+            ["crush"] = "crush",
+            ["peelOff"] = "peelOff",
+            ["pageCurlDouble"] = "pageCurlDouble",
+            ["pageCurlSingle"] = "pageCurlSingle",
+            ["airplane"] = "airplane",
+            ["origami"] = "origami",
+        };
 
     internal static void ValidateAnimationClass(string? cls)
     {
         if (string.IsNullOrEmpty(cls)) return;
         if (!_animClassValues.Contains(cls))
             throw new ArgumentException(
-                $"Invalid animation class: '{cls}'. Valid values: entrance, exit, emphasis.");
+                $"Invalid animation class: '{cls}'. Valid values: entrance, exit, emphasis, motion.");
     }
 
     internal static void ValidateAnimationDuration(string? duration)
@@ -45,6 +69,211 @@ public partial class PowerPointHandler
                 System.Globalization.CultureInfo.InvariantCulture, out var ms) || ms < 0)
             throw new ArgumentException(
                 $"Invalid animation delay: '{delay}' (expected a non-negative integer in milliseconds, e.g. delay=200).");
+    }
+
+    // L2 props (repeat / restart / autoReverse). OOXML cTn attributes are
+    // @repeatCount (ST_TLTimeNodeRepeatCountVal, integer * 1000 or "indefinite"),
+    // @restart (always | whenNotActive | never), @autoRev (xsd:boolean).
+    internal static void ValidateAnimationRepeat(string? repeat)
+    {
+        if (string.IsNullOrEmpty(repeat)) return;
+        var trimmed = repeat.Trim();
+        if (trimmed.Equals("indefinite", StringComparison.OrdinalIgnoreCase)) return;
+        if (!int.TryParse(trimmed, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out var n) || n < 1)
+            throw new ArgumentException(
+                $"Invalid animation repeat: '{repeat}' (expected a positive integer count, e.g. repeat=3, or the literal 'indefinite').");
+    }
+
+    private static readonly HashSet<string> _animRestartValues =
+        new(StringComparer.OrdinalIgnoreCase) { "always", "whenNotActive", "never" };
+
+    internal static void ValidateAnimationRestart(string? restart)
+    {
+        if (string.IsNullOrEmpty(restart)) return;
+        if (!_animRestartValues.Contains(restart.Trim()))
+            throw new ArgumentException(
+                $"Invalid animation restart: '{restart}'. Valid values: always, whenNotActive, never.");
+    }
+
+    internal static void ValidateAnimationAutoReverse(string? autoReverse)
+    {
+        if (string.IsNullOrEmpty(autoReverse)) return;
+        // IsTruthy throws on garbage. Round-trip through it so we share
+        // the project's canonical bool grammar (true/false/1/0/yes/no/on/off).
+        _ = ParseHelpers.IsTruthy(autoReverse);
+    }
+
+    // Chart-internal build animation. Drives the <a:bldChart @bld> enum inside
+    // <p:bldGraphic><p:bldSub>. Canonical values mirror OOXML directly; common
+    // aliases (byCategory / bySeries / byCategoryEl / bySeriesEl) accepted on
+    // input. asWhole is the default (no bldChart emitted; chart enters as one
+    // graphic frame, same as a regular shape animation).
+    private static readonly Dictionary<string, string> _chartBuildCanonical =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["asWhole"] = "asWhole",
+            ["allAtOnce"] = "asWhole",
+            ["whole"] = "asWhole",
+            ["series"] = "series",
+            ["bySeries"] = "series",
+            ["category"] = "category",
+            ["byCategory"] = "category",
+            ["seriesEl"] = "seriesEl",
+            ["bySeriesEl"] = "seriesEl",
+            ["seriesElement"] = "seriesEl",
+            ["bySeriesElement"] = "seriesEl",
+            ["categoryEl"] = "categoryEl",
+            ["byCategoryEl"] = "categoryEl",
+            ["categoryElement"] = "categoryEl",
+            ["byCategoryElement"] = "categoryEl",
+        };
+
+    internal static string? NormalizeChartBuild(string? value)
+    {
+        if (string.IsNullOrEmpty(value)) return null;
+        if (_chartBuildCanonical.TryGetValue(value.Trim(), out var canon)) return canon;
+        return null;
+    }
+
+    internal static void ValidateAnimationChartBuild(string? value)
+    {
+        if (string.IsNullOrEmpty(value)) return;
+        if (NormalizeChartBuild(value) == null)
+            throw new ArgumentException(
+                $"Invalid animation chartBuild: '{value}'. Valid values: asWhole, series, category, seriesEl, categoryEl "
+                + "(aliases: bySeries, byCategory, bySeriesEl, byCategoryEl).");
+    }
+
+    // Resolve the OOXML id attribute (used as <p:spTgt @spid>) for any shape-tree
+    // element that can host an animation: <p:sp>, <p:graphicFrame> (chart, smartArt,
+    // OLE), <p:pic>, <p:cxnSp>, <p:grpSp>. CONSISTENCY(animation-target): the
+    // timing tree binds purely by this id string — the underlying element type
+    // doesn't matter past this lookup.
+    internal static uint? GetAnimationTargetSpId(OpenXmlElement target) => target switch
+    {
+        Shape sp => sp.NonVisualShapeProperties?.NonVisualDrawingProperties?.Id?.Value,
+        GraphicFrame gf => gf.NonVisualGraphicFrameProperties?.NonVisualDrawingProperties?.Id?.Value,
+        Picture pic => pic.NonVisualPictureProperties?.NonVisualDrawingProperties?.Id?.Value,
+        ConnectionShape cx => cx.NonVisualConnectionShapeProperties?.NonVisualDrawingProperties?.Id?.Value,
+        GroupShape grp => grp.NonVisualGroupShapeProperties?.NonVisualDrawingProperties?.Id?.Value,
+        _ => null
+    };
+
+    // True iff the GraphicFrame embeds a chart (c:chart or cx:chart reference).
+    // SmartArt / OLE GraphicFrames return false. CONSISTENCY(animation-chart-detect):
+    // mirrors ResolveChart's filter in Resolve.cs.
+    internal static bool IsChartGraphicFrame(OpenXmlElement target)
+    {
+        if (target is not GraphicFrame gf) return false;
+        var gd = gf.Graphic?.GraphicData;
+        if (gd == null) return false;
+        if (gd.Descendants<Drawing.Charts.ChartReference>().Any()) return true;
+        const string cxNs = "http://schemas.microsoft.com/office/drawing/2014/chartex";
+        return gd.ChildElements.Any(e => e.LocalName == "chart" && e.NamespaceUri == cxNs);
+    }
+
+    // Read (series, category) counts from a chart graphicFrame's ChartPart.
+    // Extended cx:chart returns (0, 0) — per-element fan-out falls back to a
+    // single asWhole-style entrance in that case (cx schema doesn't expose the
+    // same per-element animation surface). CONSISTENCY(animation-chart-detect).
+    internal static (int seriesCount, int categoryCount) ReadChartDimensions(OpenXmlElement target, OpenXmlPart slidePart)
+    {
+        if (target is not GraphicFrame gf) return (0, 0);
+        var chartRef = gf.Descendants<Drawing.Charts.ChartReference>().FirstOrDefault();
+        if (chartRef?.Id?.Value == null) return (0, 0);
+        try
+        {
+            var part = slidePart.GetPartById(chartRef.Id.Value);
+            if (part is not DocumentFormat.OpenXml.Packaging.ChartPart chartPart) return (0, 0);
+            var plotArea = chartPart.ChartSpace?
+                .GetFirstChild<Drawing.Charts.Chart>()?.PlotArea;
+            if (plotArea == null) return (0, 0);
+            var sc = OfficeCli.Core.ChartHelper.CountSeries(plotArea);
+            var cats = OfficeCli.Core.ChartHelper.ReadCategories(plotArea);
+            return (sc, cats?.Length ?? 0);
+        }
+        catch { return (0, 0); }
+    }
+
+    // Enumerate (seriesIdx, categoryIdx, bldStep) tuples for the per-element
+    // click-group fan-out. PowerPoint's "By X" entrance generates exactly one
+    // data click-group per sub-element, all sharing one grpId. Sentinel value
+    // -4 = "all of this axis" (whole series / whole category). The bldStep
+    // enum comes from Drawing.ChartBuildStepValues. CONSISTENCY(animation-chart-fanout):
+    // matches a fresh PowerPoint-authored deck — no gridLegend head (an earlier
+    // hypothesis that turned out to be specific to PowerPoint's edit-rewrite
+    // path on certain pre-existing files, not the default authoring form).
+    internal static IEnumerable<(int seriesIdx, int categoryIdx, string bldStep)>
+        EnumerateChartBuildSteps(string mode, int seriesCount, int categoryCount)
+    {
+        if (seriesCount <= 0) yield break;
+        switch (mode)
+        {
+            case "series":
+                for (int s = 0; s < seriesCount; s++) yield return (s, -4, "series");
+                break;
+            case "category":
+                if (categoryCount <= 0) yield break;
+                for (int c = 0; c < categoryCount; c++) yield return (-4, c, "category");
+                break;
+            case "seriesEl":
+                if (categoryCount <= 0) yield break;
+                for (int s = 0; s < seriesCount; s++)
+                    for (int c = 0; c < categoryCount; c++)
+                        yield return (s, c, "ptInSeries");
+                break;
+            case "categoryEl":
+                if (categoryCount <= 0) yield break;
+                for (int c = 0; c < categoryCount; c++)
+                    for (int s = 0; s < seriesCount; s++)
+                        yield return (s, c, "ptInCategory");
+                break;
+        }
+    }
+
+    // Construct a TargetElement that points at a chart sub-element.
+    // Mirrors PowerPoint's authored form:
+    //   <p:tgtEl><p:spTgt spid="N"><p:graphicEl><a:chart .../></p:graphicEl></p:spTgt></p:tgtEl>
+    internal static TargetElement BuildChartSubTarget(string shapeId, int seriesIdx, int categoryIdx, string bldStep)
+    {
+        var chartEl = new Drawing.Chart
+        {
+            SeriesIndex = seriesIdx,
+            CategoryIndex = categoryIdx,
+            BuildStep = new EnumValue<Drawing.ChartBuildStepValues>(
+                new Drawing.ChartBuildStepValues(bldStep))
+        };
+        var spTgt = new ShapeTarget { ShapeId = shapeId };
+        spTgt.AppendChild(new GraphicElement(chartEl));
+        return new TargetElement(spTgt);
+    }
+
+    // Canonicalize a restart input string to the matching enum value. Returns
+    // null when not present (caller leaves the cTn attribute unset).
+    private static TimeNodeRestartValues? ParseAnimRestart(string? value)
+    {
+        if (string.IsNullOrEmpty(value)) return null;
+        var t = value.Trim();
+        if (t.Equals("always", StringComparison.OrdinalIgnoreCase))
+            return TimeNodeRestartValues.Always;
+        if (t.Equals("whenNotActive", StringComparison.OrdinalIgnoreCase))
+            return TimeNodeRestartValues.WhenNotActive;
+        if (t.Equals("never", StringComparison.OrdinalIgnoreCase))
+            return TimeNodeRestartValues.Never;
+        return null;
+    }
+
+    // OOXML repeatCount uses 1000ths of a count: repeat=3 → "3000".
+    private static string? FormatAnimRepeatOoxml(string? value)
+    {
+        if (string.IsNullOrEmpty(value)) return null;
+        var t = value.Trim();
+        if (t.Equals("indefinite", StringComparison.OrdinalIgnoreCase)) return "indefinite";
+        if (int.TryParse(t, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out var n) && n >= 1)
+            return (n * 1000).ToString(System.Globalization.CultureInfo.InvariantCulture);
+        return null;
     }
 
     // ==================== Slide Transitions ====================
@@ -103,7 +332,8 @@ public partial class PowerPointHandler
             "ld", "leftdown", "downleft", "rd", "rightdown", "downright",
             "in", "out",
             "h", "horiz", "horizontal", "v", "vert", "vertical",
-            "byobject", "bypage", "byword", "byletter",
+            "byobject", "object", "bypage", "byword", "word",
+            "bychar", "char", "character", "byletter",
         };
         foreach (var part in parts.Skip(1))
         {
@@ -129,6 +359,59 @@ public partial class PowerPointHandler
         // are unaffected — they only ever see one input token in canonical use.
         string? direction = dirTokens.Count == 0 ? null : string.Join("-", dirTokens);
 
+        // Direction-less transition types: any explicit direction must be a typo
+        // or stale knowledge — refuse rather than silently dropping the suffix
+        // (which produced a successful envelope for a request the user didn't
+        // make). These four CT_OptionalBlackTransition shapes have no direction
+        // attribute in OOXML.
+        if (direction != null && typeName is "circle" or "diamond" or "plus" or "wedge")
+            throw new ArgumentException(
+                $"Transition '{typeName}' does not accept a direction modifier (got '-{direction}'). "
+                + $"'{typeName}' is a direction-less shape transition in OOXML — drop the suffix and use plain 'transition={typeName}'.");
+
+        // Wheel spokes: the parts loop captured the first integer as durationMs.
+        // For type=wheel, a small integer (≤32, well above the PowerPoint UI's
+        // 1/2/3/4/8 spoke choices but below any plausible duration in ms) is the
+        // spoke count, not the duration. Consume it so 'transition=wheel-8'
+        // round-trips as 8 spokes rather than 8ms duration.
+        uint wheelSpokes = 4u;
+        if (typeName == "wheel" && durationMs != null
+            && int.TryParse(durationMs, out var wheelN) && wheelN >= 1 && wheelN <= 32)
+        {
+            wheelSpokes = (uint)wheelN;
+            durationMs = null;
+        }
+
+        // PowerPoint 2013+ "Exciting" gallery: <p15:prstTrans prst="..."/> inside
+        // mc:AlternateContent. CLI token == OOXML prst (lowerCamelCase). Schema
+        // also accepts invX / invY booleans that flip the visual direction —
+        // surfaced as the `-in` (default) / `-out` modifier. Intercepted before
+        // the typed switch because none of these elements is modeled by the SDK.
+        if (_p15PrstTokens.TryGetValue(typeName, out var prstValue))
+        {
+            var p15Ns = "http://schemas.microsoft.com/office/powerpoint/2012/main";
+            var elem = new OpenXmlUnknownElement("p15", "prstTrans", p15Ns);
+            elem.SetAttribute(new OpenXmlAttribute("", "prst", null!, prstValue));
+            var dir = direction?.ToLowerInvariant();
+            if (dir is "out")
+            {
+                // PowerPoint's Effect Options for direction-sensitive p15 presets
+                // (peelOff, airplane, origami, wind, fallOver, drape, ...) toggle
+                // ONLY invX between Left/Right. Setting invY="1" alongside makes
+                // PowerPoint silently reject the whole <p15:prstTrans> element
+                // (verified via Mac PowerPoint round-trip — its own Peel Off-Right
+                // writes `invX="1"` with no invY). Stay close to that form.
+                elem.SetAttribute(new OpenXmlAttribute("", "invX", null!, "1"));
+            }
+            else if (dir is not (null or "in"))
+            {
+                throw new ArgumentException(
+                    $"Transition '{typeName}' only accepts -in or -out (got '-{direction}').");
+            }
+            InsertTransitionWithMcWrapper(slide, elem, "p15", p15Ns, speed, durationMs);
+            return;
+        }
+
         var trans = new Transition();
         if (speed.HasValue) trans.Speed = speed.Value;
         if (durationMs != null) trans.Duration = durationMs;
@@ -148,13 +431,8 @@ public partial class PowerPointHandler
             "push" => new PushTransition { Direction = ParseSlideDir(direction ?? "left") },
             "cover" => new CoverTransition { Direction = ParseSlideDirStr(direction ?? "left") },
             "pull" or "uncover" => new PullTransition { Direction = ParseSlideDirStr(direction ?? "right") },
-            "wheel" => new WheelTransition { Spokes = new UInt32Value(4u) },
+            "wheel" => new WheelTransition { Spokes = new UInt32Value(wheelSpokes) },
             "zoom" => new ZoomTransition { Direction = ParseInOutDir(direction ?? "in") },
-            // <p:box> shares CT_OptionalBlackTransition with <p:zoom> but is a distinct
-            // schema element. OpenXml SDK 3.x models only ZoomTransition, so emit <p:box>
-            // via a raw OpenXmlUnknownElement so set transition=box doesn't silently
-            // collapse to the same <p:zoom> XML.
-            "box" => BuildBoxTransition(direction),
             "split" => BuildSplitTransition(direction),
             "blinds" or "venetian" => new BlindsTransition { Direction = ParseOrientation(direction ?? "horizontal") },
             "checker" or "checkerboard" => new CheckerTransition { Direction = ParseOrientation(direction ?? "horizontal") },
@@ -168,19 +446,32 @@ public partial class PowerPointHandler
             "flip" => new DocumentFormat.OpenXml.Office2010.PowerPoint.FlipTransition { Direction = ParseLeftRightDir(direction ?? "left") },
             "ripple" => new DocumentFormat.OpenXml.Office2010.PowerPoint.RippleTransition(),
             "glitter" => new DocumentFormat.OpenXml.Office2010.PowerPoint.GlitterTransition { Direction = ParseSlideDir(direction ?? "left") },
-            "prism" => new DocumentFormat.OpenXml.Office2010.PowerPoint.PrismTransition(),
+            // <p14:prism>: same element, three behaviors differentiated by
+            // isContent / isInverted bool attrs (verified via Mac PowerPoint UI
+            // round-trip). PowerPoint's gallery surfaces them as three distinct
+            // tiles even though the underlying element is identical:
+            //   bare prism (no attrs)               → "Cube"  in Exciting group
+            //   isContent="1"                       → "Rotate" in Dynamic Content
+            //   isContent="1" isInverted="1"        → "Orbit"  in Dynamic Content
+            // 'prism' is kept as the legacy CLI spelling; 'cube' is the modern
+            // UI alias for the same XML.
+            "prism" or "cube" => new DocumentFormat.OpenXml.Office2010.PowerPoint.PrismTransition(),
+            "rotate" => new DocumentFormat.OpenXml.Office2010.PowerPoint.PrismTransition { IsContent = true },
+            "orbit" => new DocumentFormat.OpenXml.Office2010.PowerPoint.PrismTransition { IsContent = true, IsInverted = true },
+            // Clock UI tile = single-spoke wheel.
+            "clock" => new WheelTransition { Spokes = new UInt32Value(1u) },
             "doors" => new DocumentFormat.OpenXml.Office2010.PowerPoint.DoorsTransition { Direction = ParseOrientation(direction ?? "horizontal") },
             "window" => new DocumentFormat.OpenXml.Office2010.PowerPoint.WindowTransition { Direction = ParseOrientation(direction ?? "horizontal") },
-            "shred" => new DocumentFormat.OpenXml.Office2010.PowerPoint.ShredTransition(),
-            "ferris" => new DocumentFormat.OpenXml.Office2010.PowerPoint.FerrisTransition(),
-            "flythrough" => new DocumentFormat.OpenXml.Office2010.PowerPoint.FlythroughTransition(),
-            "warp" => new DocumentFormat.OpenXml.Office2010.PowerPoint.WarpTransition(),
-            "gallery" => new DocumentFormat.OpenXml.Office2010.PowerPoint.GalleryTransition(),
-            "conveyor" => new DocumentFormat.OpenXml.Office2010.PowerPoint.ConveyorTransition(),
+            "shred" => new DocumentFormat.OpenXml.Office2010.PowerPoint.ShredTransition { Direction = ParseInOutDir(direction ?? "in") },
+            "ferris" => new DocumentFormat.OpenXml.Office2010.PowerPoint.FerrisTransition { Direction = ParseLeftRightDir(direction ?? "left") },
+            "flythrough" => new DocumentFormat.OpenXml.Office2010.PowerPoint.FlythroughTransition { Direction = ParseInOutDir(direction ?? "in") },
+            "warp" => new DocumentFormat.OpenXml.Office2010.PowerPoint.WarpTransition { Direction = ParseInOutDir(direction ?? "in") },
+            "gallery" => new DocumentFormat.OpenXml.Office2010.PowerPoint.GalleryTransition { Direction = ParseLeftRightDir(direction ?? "left") },
+            "conveyor" => new DocumentFormat.OpenXml.Office2010.PowerPoint.ConveyorTransition { Direction = ParseLeftRightDir(direction ?? "left") },
             "pan" => new DocumentFormat.OpenXml.Office2010.PowerPoint.PanTransition { Direction = ParseSlideDir(direction ?? "left") },
-            "reveal" => new DocumentFormat.OpenXml.Office2010.PowerPoint.RevealTransition(),
+            "reveal" => new DocumentFormat.OpenXml.Office2010.PowerPoint.RevealTransition { Direction = ParseLeftRightDir(direction ?? "left") },
             "morph" => null, // handled specially below
-            _ => throw new ArgumentException($"Invalid transition type: '{typeName}'. Valid values: fade, cut, dissolve, circle, diamond, newsflash, plus, random, wedge, wipe, push, cover, pull, wheel, zoom, split, blinds, checker, comb, bars, strips, flash, honeycomb, vortex, switch, flip, ripple, glitter, prism, doors, window, shred, ferris, flythrough, warp, gallery, conveyor, pan, reveal, morph, none.")
+            _ => throw new ArgumentException($"Invalid transition type: '{typeName}'. Valid values: fade, cut, dissolve, circle, diamond, newsflash, plus, random, wedge, wipe, push, cover, pull, wheel, zoom, split, blinds, checker, comb, bars, strips, flash, honeycomb, vortex, switch, flip, ripple, glitter, prism, cube, rotate, orbit, clock, doors, window, shred, ferris, flythrough, warp, gallery, conveyor, pan, reveal, morph, box, fallOver, drape, curtains, wind, prestige, fracture, crush, peelOff, pageCurlDouble, pageCurlSingle, airplane, origami, none.")
         };
 
         // Morph transition: requires mc:AlternateContent wrapper with p159 namespace
@@ -372,18 +663,6 @@ public partial class PowerPointHandler
             _ => throw new ArgumentException($"Invalid corner direction: '{dir}'. Valid values: leftup, rightup, leftdown, rightdown.")
         };
 
-    private static OpenXmlUnknownElement BuildBoxTransition(string? direction)
-    {
-        var pNs = "http://schemas.openxmlformats.org/presentationml/2006/main";
-        var box = new OpenXmlUnknownElement("p", "box", pNs);
-        // dir attribute mirrors ZoomTransition: ST_TransitionInOutDirectionType (in/out).
-        var dir = (direction ?? "in").ToLowerInvariant();
-        if (dir != "in" && dir != "out")
-            throw new ArgumentException($"Invalid box transition direction: '{direction}'. Valid values: in, out.");
-        box.SetAttribute(new OpenXmlAttribute("", "dir", null!, dir));
-        return box;
-    }
-
     private static SplitTransition BuildSplitTransition(string? direction)
     {
         var orient = DirectionValues.Horizontal;
@@ -410,12 +689,16 @@ public partial class PowerPointHandler
         // form keeps writing both attributes. Without this, both inputs landed
         // on identical XML and readback always returned "split".
         var split = new SplitTransition { Orientation = orient };
-        if (inOut.HasValue) split.Direction = inOut.Value;
-        // Keep orient on the XML even when the caller didn't pick one — it's the
-        // single attribute that distinguishes split from the bare-no-attr
-        // signature reserved for the future case. orientGiven is consulted only
-        // to leave room for a future fully-bare emit if needed.
-        _ = orientGiven;
+        if (inOut.HasValue)
+            split.Direction = inOut.Value;
+        else if (orientGiven)
+            // Caller gave an orientation but no in/out (e.g. 'split-vertical').
+            // OOXML <p:split> takes both orient and dir; default the missing
+            // half to 'in' so the readback path can surface 'split-vertical-in'
+            // instead of collapsing the orient. Bare 'split' (no orient given)
+            // still emits orient="horz" with no dir, preserving the distinct
+            // signature that round-trips as plain 'split'.
+            split.Direction = TransitionInOutDirectionValues.In;
         return split;
     }
 
@@ -434,11 +717,17 @@ public partial class PowerPointHandler
     /// Examples: "fade", "fly-entrance", "zoom-exit-800", "fade-in-500-after",
     ///           "wipe-entrance-1000-with", "fade-entrance-500-click", "none"
     /// </summary>
-    private static void ApplyShapeAnimation(SlidePart slidePart, Shape shape, string value)
+    private static void ApplyShapeAnimation(SlidePart slidePart, OpenXmlElement target, string value)
     {
         var slide = slidePart.Slide ?? throw new InvalidOperationException("Corrupt file");
-        var shapeId = shape.NonVisualShapeProperties?.NonVisualDrawingProperties?.Id?.Value
-            ?? throw new ArgumentException("Shape has no ID");
+        var shapeId = GetAnimationTargetSpId(target)
+            ?? throw new ArgumentException("Animation target has no OOXML id (NonVisualDrawingProperties/@id missing).");
+        // CONSISTENCY(animation-target): chart graphicFrames bind by the same id
+        // as a plain <p:sp> shape, so the timing tree code below is type-agnostic.
+        // Only the <p:bldLst> entry differs: chart targets emit <p:bldGraphic>
+        // (optionally with <a:bldChart bld=...> for per-series/category builds);
+        // everything else emits <p:bldP>.
+        var isChartTarget = IsChartGraphicFrame(target);
 
         if (value.Equals("none", StringComparison.OrdinalIgnoreCase) ||
             value.Equals("false", StringComparison.OrdinalIgnoreCase))
@@ -456,6 +745,13 @@ public partial class PowerPointHandler
         string? direction = null;
         AnimTrigger? explicitTrigger = null;
         int delayMs = 0, easingAccel = 0, easingDecel = 0;
+        // L2 props (set on the effect cTn via @repeatCount / @restart / @autoRev).
+        string? repeatRaw = null;
+        string? restartRaw = null;
+        bool? autoReverse = null;
+        // chartBuild rides outside the cTn — emitted as <p:bldGraphic>/<a:bldChart>
+        // alongside the click group. Only meaningful when target is a chart.
+        string? chartBuildRaw = null;
         var unrecognized = new List<string>();
 
         // bt-1 / fuzz-1 fix: top-level animation= prop bypasses the
@@ -480,6 +776,14 @@ public partial class PowerPointHandler
         for (int i = 1; i < parts.Length; i++)
         {
             var seg = parts[i].ToLowerInvariant();
+            // CONSISTENCY(animation-double-dash): a literal `--` in the input
+            // (e.g. `fade-entrance--1000` for a negative duration) emits an
+            // empty segment between the dashes. Skip it — the adjacent token
+            // after it carries the numeric value, which the int.TryParse arm
+            // below handles (clamping to >= 0 via Math.Max). Without this,
+            // the empty string fell to `unrecognized.Add(seg)` and fired a
+            // spurious warning even though the animation applied correctly.
+            if (string.IsNullOrEmpty(seg)) continue;
             // Class?
             if (seg is "entrance" or "in" or "entr")
                 RecordClass(seg, TimeNodePresetClassValues.Entrance);
@@ -498,12 +802,30 @@ public partial class PowerPointHandler
             else if (seg is "left" or "l" or "right" or "r" or "up" or "top" or "u"
                      or "down" or "bottom" or "d")
                 direction = seg;
-            // key=value (delay, easing, easein, easeout)?
+            // key=value (delay, easing, easein, easeout, repeat, restart, autoreverse)?
             else if (seg.Contains('='))
             {
                 var eqIdx = seg.IndexOf('=');
                 var kKey = seg[..eqIdx];
-                if (int.TryParse(seg[(eqIdx + 1)..], out var kVal))
+                var kRaw = seg[(eqIdx + 1)..];
+                // String-valued L2 props (preserve case from the original
+                // value string — `seg` was lowered but we want canonical
+                // enum spelling for restart and the literal "indefinite"
+                // for repeat). Re-extract from the un-lowered `parts`.
+                if (kKey is "repeat" or "restart" or "autoreverse" or "chartbuild")
+                {
+                    var origSeg = parts[i];
+                    var origEq = origSeg.IndexOf('=');
+                    var origRaw = origEq >= 0 ? origSeg[(origEq + 1)..] : kRaw;
+                    switch (kKey)
+                    {
+                        case "repeat": repeatRaw = origRaw; break;
+                        case "restart": restartRaw = origRaw; break;
+                        case "autoreverse": autoReverse = ParseHelpers.IsTruthy(origRaw); break;
+                        case "chartbuild": chartBuildRaw = origRaw; break;
+                    }
+                }
+                else if (int.TryParse(kRaw, out var kVal))
                 {
                     switch (kKey)
                     {
@@ -545,9 +867,27 @@ public partial class PowerPointHandler
                 ? AnimTrigger.AfterPrevious : AnimTrigger.OnClick;
         }
 
-        // Get filter string, preset ID, and subtype from effect name
-        var (presetId, filter) = GetAnimPreset(effectName, presetClass);
-        var presetSubtype = GetAnimPresetSubtype(effectName, direction);
+        // Template-based effects (Boomerang, Pinwheel, ...) live in
+        // _templateRegistry and bypass the simple filter-based path. Look up
+        // first so the standard preset/filter path doesn't reject them as
+        // unknown.
+        var effectTemplate = TryGetEffectTemplate(effectName, presetClass);
+
+        // Get filter string, preset ID, and subtype from effect name.
+        // Template effects keep the lookup so the schema-described
+        // preset/subtype is reported, but the actual XML comes from the template.
+        int presetId; string? filter; int presetSubtype;
+        if (effectTemplate != null)
+        {
+            presetId = effectTemplate.PresetId;
+            presetSubtype = effectTemplate.PresetSubtype;
+            filter = null;
+        }
+        else
+        {
+            (presetId, filter) = GetAnimPreset(effectName, presetClass);
+            presetSubtype = GetAnimPresetSubtype(effectName, direction);
+        }
         var nodeType = trigger switch
         {
             AnimTrigger.AfterPrevious => TimeNodeValues.AfterEffect,
@@ -565,11 +905,52 @@ public partial class PowerPointHandler
         // The outer click-group delay depends on trigger
         var outerDelay = trigger == AnimTrigger.OnClick ? "indefinite" : "0";
 
+        // Per-element chart fan-out: when chartBuild is series/category/seriesEl/categoryEl
+        // PowerPoint authoring writes N+1 click-group <p:par> siblings under mainSeq
+        // (a gridLegend head plus one per sub-element), ALL sharing the same grpId.
+        // The user sees this as a single "By Series" / "By Category" entrance in the
+        // Animation Pane. Falls back to the single-shape click-group when the target
+        // isn't a chart, the mode is asWhole, or the chart dimensions can't be read.
+        // CONSISTENCY(animation-chart-fanout): mirrors PowerPoint's authored form.
+        var preChartBuildCanon = NormalizeChartBuild(chartBuildRaw);
+        var doChartFanOut = isChartTarget
+            && preChartBuildCanon != null
+            && preChartBuildCanon != "asWhole"
+            && trigger != AnimTrigger.WithPrevious;
+        if (doChartFanOut)
+        {
+            var (seriesCnt, catCnt) = ReadChartDimensions(target, slidePart);
+            var steps = EnumerateChartBuildSteps(preChartBuildCanon!, seriesCnt, catCnt).ToList();
+            // No data steps (chart with zero series or zero categories on a mode
+            // that needs them) → fall back to the single asWhole-style click-group
+            // below rather than emit a degenerate timing tree.
+            if (steps.Count > 0)
+            {
+                foreach (var (sIdx, cIdx, bldStep) in steps)
+                {
+                    var subTargetFactory = (Func<TargetElement>)(() =>
+                        BuildChartSubTarget(shapeId.ToString(), sIdx, cIdx, bldStep));
+                    var subGroup = BuildClickGroup(
+                        shapeId.ToString(), presetId, presetClass, nodeType,
+                        durationMs, filter, grpId, outerDelay, presetSubtype, ref nextId,
+                        delayMs, easingAccel, easingDecel,
+                        repeatRaw, restartRaw, autoReverse,
+                        makeTarget: subTargetFactory,
+                        template: effectTemplate,
+                        chartTemplateTarget: effectTemplate != null ? (sIdx, cIdx, bldStep) : null);
+                    mainSeqCTn.ChildTimeNodeList!.AppendChild(subGroup);
+                }
+                goto applyBldLst;
+            }
+        }
+
         // Build the animation par
         var clickGroup = BuildClickGroup(
             shapeId.ToString(), presetId, presetClass, nodeType,
             durationMs, filter, grpId, outerDelay, presetSubtype, ref nextId,
-            delayMs, easingAccel, easingDecel);
+            delayMs, easingAccel, easingDecel,
+            repeatRaw, restartRaw, autoReverse,
+            template: effectTemplate);
 
         if (trigger == AnimTrigger.WithPrevious)
         {
@@ -602,14 +983,59 @@ public partial class PowerPointHandler
             mainSeqCTn.ChildTimeNodeList!.AppendChild(clickGroup);
         }
 
-        // Update bldLst if not already there
+        applyBldLst:
+        // Update bldLst if not already there.
+        // Shape targets get <p:bldP>; chart targets get <p:bldGraphic>, optionally
+        // carrying <p:bldSub><a:bldChart bld="..."/> for per-series/category builds.
+        // chartBuild is only valid against a chart graphicFrame — reject early
+        // rather than silently dropping the build directive.
         var shapeIdStr = shapeId.ToString();
+        if (!string.IsNullOrEmpty(chartBuildRaw) && !isChartTarget)
+            throw new ArgumentException(
+                "chartBuild is only valid when the animation target is a chart graphicFrame "
+                + "(/slide[N]/chart[M]). Plain shapes don't support per-series/category builds.");
+        var chartBuildCanon = NormalizeChartBuild(chartBuildRaw);
         if (bldLst == null)
         {
             bldLst = new BuildList();
             slide.GetFirstChild<Timing>()!.BuildList = bldLst;
         }
-        if (!bldLst.Elements<BuildParagraph>()
+        if (isChartTarget)
+        {
+            // Replace any existing BuildGraphics for this spid so chartBuild
+            // override on a re-Add reflects in the file. (Shape <p:bldP> path
+            // below leaves existing entries alone — matches prior behaviour.)
+            // NB: SDK class is BuildGraphics (plural); wire element is <p:bldGraphic>.
+            var existingGraphics = bldLst.Elements<BuildGraphics>()
+                .Where(b => b.ShapeId?.Value == shapeIdStr)
+                .ToList();
+            foreach (var eg in existingGraphics) eg.Remove();
+            var bldGraphic = new BuildGraphics
+            {
+                ShapeId = shapeIdStr,
+                GroupId = new UInt32Value((uint)grpId)
+            };
+            // OOXML schema (CT_TLBuildGraphic) requires exactly one of
+            // <p:bldAsOne/> or <p:bldSub>...</p:bldSub> — an empty bldGraphic
+            // makes PowerPoint refuse the file with a schema-incomplete error.
+            // asWhole / null → bldAsOne; everything else → bldSub/bldChart.
+            if (chartBuildCanon == null || chartBuildCanon == "asWhole")
+            {
+                bldGraphic.AppendChild(new BuildAsOne());
+            }
+            else
+            {
+                // SDK exposes <a:bldChart @bld> as a StringValue (not the typed
+                // AnimationBuildValues enum) — write the canonical OOXML token
+                // directly so PowerPoint reads it back unchanged.
+                var bldSub = new BuildSubElement();
+                var bldChart = new Drawing.BuildChart { Build = chartBuildCanon };
+                bldSub.AppendChild(bldChart);
+                bldGraphic.AppendChild(bldSub);
+            }
+            bldLst.AppendChild(bldGraphic);
+        }
+        else if (!bldLst.Elements<BuildParagraph>()
                 .Any(b => b.ShapeId?.Value == shapeIdStr))
         {
             bldLst.AppendChild(new BuildParagraph
@@ -620,7 +1046,7 @@ public partial class PowerPointHandler
         }
     }
 
-    private enum AnimTrigger { OnClick, AfterPrevious, WithPrevious }
+    internal enum AnimTrigger { OnClick, AfterPrevious, WithPrevious }
 
     // ==================== Timing Helpers ====================
 
@@ -730,8 +1156,66 @@ public partial class PowerPointHandler
         ref uint nextId,
         int delayMs = 0,
         int easingAccel = 0,
-        int easingDecel = 0)
+        int easingDecel = 0,
+        string? repeat = null,
+        string? restart = null,
+        bool? autoReverse = null,
+        Func<TargetElement>? makeTarget = null,
+        EffectTemplate? template = null,
+        (int seriesIdx, int categoryIdx, string bldStep)? chartTemplateTarget = null)
     {
+        // makeTarget lets callers substitute the default plain-shape spTgt with
+        // a chart sub-element target (<p:spTgt><p:graphicEl><a:chart .../></p:graphicEl></p:spTgt>).
+        // Default keeps the long-standing shape-only behaviour.
+        TargetElement Tgt() => makeTarget?.Invoke()
+            ?? new TargetElement(new ShapeTarget { ShapeId = shapeId });
+
+        // Template-based effect (Boomerang, Pinwheel, Curve Down, etc.): the
+        // effectPar's childTnLst comes from a PowerPoint-authored OOXML fragment
+        // verbatim. Skip the manual builder branches below.
+        if (template != null)
+        {
+            var rendered = RenderEffectTemplate(template, shapeId, ref nextId, chartTemplateTarget,
+                durationMsOverride: durationMs > 0 ? durationMs : (int?)null);
+            var tplChildList = ParseTemplateChildTimeNodeList(rendered);
+            var tplEffectId = nextId++;
+            var tplEffectCTn = new CommonTimeNode
+            {
+                Id = tplEffectId,
+                PresetId = template.PresetId,
+                PresetClass = presetClass,
+                PresetSubtype = template.PresetSubtype,
+                Fill = TimeNodeFillValues.Hold,
+                GroupId = (uint)grpId,
+                NodeType = nodeType,
+                StartConditionList = new StartConditionList(new Condition { Delay = "0" }),
+                ChildTimeNodeList = tplChildList
+            };
+            // Mirror the non-template path (line ~1344): store duration on the
+            // effectCTn itself so PopulateAnimationNode can recover the actual
+            // value instead of falling through to the hardcoded 500ms default.
+            if (durationMs > 0)
+                tplEffectCTn.Duration = durationMs.ToString();
+            var tplEffectPar = new ParallelTimeNode { CommonTimeNode = tplEffectCTn };
+            var tplMidId = nextId++;
+            var tplMidCTn = new CommonTimeNode
+            {
+                Id = tplMidId,
+                Fill = TimeNodeFillValues.Hold,
+                StartConditionList = new StartConditionList(new Condition { Delay = delayMs > 0 ? delayMs.ToString() : "0" }),
+                ChildTimeNodeList = new ChildTimeNodeList(tplEffectPar)
+            };
+            var tplMidPar = new ParallelTimeNode { CommonTimeNode = tplMidCTn };
+            var tplOuterId = nextId++;
+            var tplOuterCTn = new CommonTimeNode
+            {
+                Id = tplOuterId,
+                Fill = TimeNodeFillValues.Hold,
+                StartConditionList = new StartConditionList(new Condition { Delay = outerDelay }),
+                ChildTimeNodeList = new ChildTimeNodeList(tplMidPar)
+            };
+            return new ParallelTimeNode { CommonTimeNode = tplOuterCTn };
+        }
         var isEntrance = presetClass == TimeNodePresetClassValues.Entrance;
         var isEmphasis = presetClass == TimeNodePresetClassValues.Emphasis;
         var animTransition = isEntrance || isEmphasis ? AnimateEffectTransitionValues.In : AnimateEffectTransitionValues.Out;
@@ -759,7 +1243,7 @@ public partial class PowerPointHandler
                     Fill = TimeNodeFillValues.Hold,
                     StartConditionList = setStCond
                 },
-                new TargetElement(new ShapeTarget { ShapeId = shapeId }),
+                Tgt(),
                 new AttributeNameList(new AttributeName("style.visibility"))
             ),
             new ToVariantValue(new StringVariantValue { Val = isEntrance || isEmphasis ? "visible" : "hidden" })
@@ -780,7 +1264,7 @@ public partial class PowerPointHandler
                 ZoomContents = true,
                 CommonBehavior = new CommonBehavior(
                     new CommonTimeNode { Id = animEffId, Duration = durationMs.ToString(), Fill = TimeNodeFillValues.Hold },
-                    new TargetElement(new ShapeTarget { ShapeId = shapeId })
+                    Tgt()
                 )
             };
             if (isEntrance)
@@ -803,7 +1287,7 @@ public partial class PowerPointHandler
                 By = isEntrance ? 21600000 : -21600000, // ±360° in 60000ths of a degree
                 CommonBehavior = new CommonBehavior(
                     new CommonTimeNode { Id = animEffId, Duration = durationMs.ToString(), Fill = TimeNodeFillValues.Hold },
-                    new TargetElement(new ShapeTarget { ShapeId = shapeId })
+                    Tgt()
                 )
             };
             effectChildList.AppendChild(animRot);
@@ -815,7 +1299,7 @@ public partial class PowerPointHandler
                 Filter = "fade",
                 CommonBehavior = new CommonBehavior(
                     new CommonTimeNode { Id = fadeId, Duration = durationMs.ToString() },
-                    new TargetElement(new ShapeTarget { ShapeId = shapeId })
+                    Tgt()
                 )
             };
             effectChildList.AppendChild(fadeEffect);
@@ -832,7 +1316,7 @@ public partial class PowerPointHandler
                         Id = animEffId,
                         Duration = durationMs.ToString()
                     },
-                    new TargetElement(new ShapeTarget { ShapeId = shapeId })
+                    Tgt()
                 )
             };
             effectChildList.AppendChild(animEffect);
@@ -866,6 +1350,14 @@ public partial class PowerPointHandler
             effectCTn.Duration = durationMs.ToString();
         if (easingAccel > 0) effectCTn.Acceleration = easingAccel;
         if (easingDecel > 0) effectCTn.Deceleration = easingDecel;
+        // L2 attributes on the effect cTn. repeat/restart/autoReverse all map
+        // 1:1 to OOXML cTn attributes (@repeatCount/@restart/@autoRev). We
+        // apply them only when supplied so the cTn stays minimal otherwise.
+        var repeatOoxml = FormatAnimRepeatOoxml(repeat);
+        if (repeatOoxml != null) effectCTn.RepeatCount = repeatOoxml;
+        var restartEnum = ParseAnimRestart(restart);
+        if (restartEnum != null) effectCTn.Restart = restartEnum.Value;
+        if (autoReverse.HasValue) effectCTn.AutoReverse = autoReverse.Value;
         var effectPar = new ParallelTimeNode { CommonTimeNode = effectCTn };
 
         // --- middle cTn (delay wrapper) ---
@@ -955,53 +1447,76 @@ public partial class PowerPointHandler
     /// <see cref="RemoveShapeAnimations"/>'s walk-up) and removes that par.
     /// Also removes the BuildList entry for the shape if no animations remain.
     /// </summary>
-    private void RemoveSingleShapeAnimation(SlidePart slidePart, Shape shape, int kIndex)
+    private void RemoveSingleShapeAnimation(SlidePart slidePart, OpenXmlElement target, int kIndex)
     {
-        var ctns = EnumerateShapeAnimationCTns(slidePart, shape);
+        var ctns = EnumerateShapeAnimationCTns(slidePart, target);
         if (kIndex < 1 || kIndex > ctns.Count)
             throw new ArgumentException($"Animation {kIndex} not found (total: {ctns.Count})");
 
         var targetCTn = ctns[kIndex - 1];
 
-        // Walk up to find the top-level click-group par inside mainSeq childTnLst
-        OpenXmlElement? node = targetCTn;
-        OpenXmlElement? clickGroupPar = null;
-        while (node?.Parent != null)
+        // Determine the logical animation's grpId. Chart per-element entrances
+        // fan out to N+1 click-groups all sharing one grpId; removing animation[K]
+        // must drop EVERY click-group in that group, not just the representative
+        // cTn returned by EnumerateShapeAnimationCTns. Shape animations have
+        // unique grpId so this is a no-op widening for them.
+        // CONSISTENCY(animation-chart-fanout).
+        var targetGrpId = targetCTn.GroupId?.Value;
+        var slideTiming = slidePart.Slide?.GetFirstChild<Timing>();
+        var spIdStr0 = GetAnimationTargetSpId(target)?.ToString();
+        var clickGroupPars = new List<OpenXmlElement>();
+        if (targetGrpId.HasValue && slideTiming != null && spIdStr0 != null)
         {
-            if (node.Parent is ChildTimeNodeList ctl &&
-                ctl.Parent is CommonTimeNode ctn &&
-                ctn.NodeType?.Value == TimeNodeValues.MainSequence)
+            foreach (var cand in slideTiming.Descendants<CommonTimeNode>())
             {
-                clickGroupPar = node;
-                break;
+                if (cand.GroupId?.Value != targetGrpId.Value) continue;
+                if (!cand.Descendants<ShapeTarget>().Any(st => st.ShapeId?.Value == spIdStr0)) continue;
+                // Walk up to the click-group par under mainSeq for this cTn.
+                OpenXmlElement? node = cand;
+                while (node?.Parent != null)
+                {
+                    if (node.Parent is ChildTimeNodeList ctl &&
+                        ctl.Parent is CommonTimeNode ctn2 &&
+                        ctn2.NodeType?.Value == TimeNodeValues.MainSequence)
+                    {
+                        if (!clickGroupPars.Contains(node)) clickGroupPars.Add(node);
+                        break;
+                    }
+                    node = node.Parent;
+                }
             }
-            node = node.Parent;
         }
-
-        if (clickGroupPar == null)
+        if (clickGroupPars.Count == 0)
         {
-            // Fallback: just remove the effect CTn's nearest par ancestor.
+            // Fallback: drop the effect CTn's nearest par ancestor.
             targetCTn.Ancestors<ParallelTimeNode>().FirstOrDefault()?.Remove();
         }
         else
         {
-            clickGroupPar.Remove();
+            foreach (var par in clickGroupPars) par.Remove();
         }
 
-        // If no animations remain for this shape, drop its BuildList entry.
+        // If no animations remain for this target, drop its BuildList entry.
+        // Clean both BuildParagraph (shape targets) and BuildGraphics (chart
+        // targets) — one of them is always a no-op for a given spid, but
+        // keeping the path uniform avoids forking the cleanup by element kind.
         var slide = slidePart.Slide ?? throw new InvalidOperationException("Corrupt file");
-        var shapeId = shape.NonVisualShapeProperties?.NonVisualDrawingProperties?.Id?.Value;
+        var shapeId = GetAnimationTargetSpId(target);
         if (shapeId.HasValue)
         {
-            var remaining = EnumerateShapeAnimationCTns(slidePart, shape);
+            var remaining = EnumerateShapeAnimationCTns(slidePart, target);
             if (remaining.Count == 0)
             {
                 var bldLst = slide.GetFirstChild<Timing>()?.BuildList;
                 if (bldLst != null)
                 {
+                    var spIdStr = shapeId.Value.ToString();
                     foreach (var bp in bldLst.Elements<BuildParagraph>()
-                        .Where(b => b.ShapeId?.Value == shapeId.Value.ToString()).ToList())
+                        .Where(b => b.ShapeId?.Value == spIdStr).ToList())
                         bp.Remove();
+                    foreach (var bg in bldLst.Elements<BuildGraphics>()
+                        .Where(b => b.ShapeId?.Value == spIdStr).ToList())
+                        bg.Remove();
                 }
             }
         }
@@ -1039,13 +1554,16 @@ public partial class PowerPointHandler
         foreach (var node in toRemove)
             node!.Remove();
 
-        // Remove from bldLst
+        // Remove from bldLst (both bldP for shapes and bldGraphic for charts).
         var bldLst = timing.BuildList;
         if (bldLst != null)
         {
             foreach (var bp in bldLst.Elements<BuildParagraph>()
-                .Where(b => b.ShapeId?.Value == shapeId.ToString()).ToList())
+                .Where(b => b.ShapeId?.Value == spIdStr).ToList())
                 bp.Remove();
+            foreach (var bg in bldLst.Elements<BuildGraphics>()
+                .Where(b => b.ShapeId?.Value == spIdStr).ToList())
+                bg.Remove();
         }
     }
 
@@ -1153,6 +1671,150 @@ public partial class PowerPointHandler
         else
         {
             mainSeqCTn.ChildTimeNodeList!.AppendChild(motionGroup);
+        }
+    }
+
+    // ==================== Motion path presets (L3 sub-B) ====================
+    // v1 preset catalogue. PowerPoint ships 60+ motion path presets; we expose
+    // 6 commonly-used geometric ones — line/arc/circle/diamond/triangle/square —
+    // with optional direction= for the two open shapes (line/arc). The path
+    // strings are emitted into <p:animMotion path="…"> verbatim and are
+    // rendered literally by PowerPoint regardless of whether they hash to a
+    // recognised preset GUID. Coords are normalised to 0..1 of slide.
+    // CONSISTENCY(animation-motion-presets): the inverse map in
+    // ResolveMotionPreset must round-trip every value emitted here so Get
+    // returns the same `path=` name the caller supplied to Add.
+    private static readonly Dictionary<string, string> _motionPresetPaths =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["line"]          = "M 0 0 L 0.5 0 E",     // default direction=right
+            ["line-right"]    = "M 0 0 L 0.5 0 E",
+            ["line-left"]     = "M 0 0 L -0.5 0 E",
+            ["line-down"]     = "M 0 0 L 0 0.5 E",
+            ["line-up"]       = "M 0 0 L 0 -0.5 E",
+            ["arc"]           = "M 0 0 C 0 0 0.25 -0.25 0.5 0 E",   // default direction=right
+            ["arc-right"]     = "M 0 0 C 0 0 0.25 -0.25 0.5 0 E",
+            ["arc-left"]      = "M 0 0 C 0 0 -0.25 -0.25 -0.5 0 E",
+            ["arc-down"]      = "M 0 0 C 0 0 0.25 0.25 0 0.5 E",
+            ["arc-up"]        = "M 0 0 C 0 0 0.25 -0.25 0 -0.5 E",
+            ["circle"]        = "M 0 0 C -0.083 0 -0.15 -0.067 -0.15 -0.15 C -0.15 -0.233 -0.083 -0.3 0 -0.3 C 0.083 -0.3 0.15 -0.233 0.15 -0.15 C 0.15 -0.067 0.083 0 0 0 Z E",
+            ["diamond"]       = "M 0 0 L 0.15 -0.15 L 0 -0.3 L -0.15 -0.15 Z E",
+            ["triangle"]      = "M 0 0 L 0.15 -0.3 L -0.15 -0.3 Z E",
+            ["square"]        = "M 0 0 L 0.3 0 L 0.3 -0.3 L 0 -0.3 Z E",
+        };
+
+    /// <summary>
+    /// Map (preset, optional direction) → OOXML path string. direction is only
+    /// honoured for shapes with a direction-aware variant (line, arc); other
+    /// presets ignore direction. Returns null for unknown preset names.
+    /// </summary>
+    internal static string? GetMotionPresetPath(string preset, string? direction)
+    {
+        if (string.IsNullOrEmpty(preset)) return null;
+        var pLower = preset.ToLowerInvariant();
+        if (!string.IsNullOrEmpty(direction))
+        {
+            var key = $"{pLower}-{direction.ToLowerInvariant()}";
+            if (_motionPresetPaths.TryGetValue(key, out var p)) return p;
+        }
+        return _motionPresetPaths.TryGetValue(pLower, out var bare) ? bare : null;
+    }
+
+    /// <summary>
+    /// Inverse of GetMotionPresetPath — used by Get to round-trip a stored
+    /// path string back to its preset name (+ direction). Returns (null, null)
+    /// when the path doesn't match any preset (custom path).
+    /// </summary>
+    internal static (string? preset, string? direction) ResolveMotionPreset(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return (null, null);
+        var canon = System.Text.RegularExpressions.Regex.Replace(path.Trim(), @"\s+", " ");
+        foreach (var (key, val) in _motionPresetPaths)
+        {
+            if (val == canon)
+            {
+                var dash = key.IndexOf('-');
+                if (dash < 0) return (key, null);
+                return (key[..dash], key[(dash + 1)..]);
+            }
+        }
+        return (null, null);
+    }
+
+    internal static IEnumerable<string> KnownMotionPresets()
+        => new[] { "line", "arc", "circle", "diamond", "triangle", "square", "custom" };
+
+    /// <summary>
+    /// Append (do not replace) a motion-path animation to the shape's chain.
+    /// Used by Add(--type animation, class=motion). Mirrors ApplyShapeAnimation's
+    /// append model so multiple motion paths or motion-mixed-with-entrance
+    /// chains round-trip via animation[K]. Caller is responsible for resolving
+    /// preset→path before calling.
+    /// CONSISTENCY(animation-chain): same outer-par-on-MainSequence shape used
+    /// by ApplyShapeAnimation so EnumerateShapeAnimationCTns sees both flavours.
+    /// </summary>
+    internal static void AppendMotionPathAnimation(SlidePart slidePart, Shape shape,
+        string pathString, int durationMs, AnimTrigger trigger,
+        int delayMs, int easingAccel, int easingDecel)
+    {
+        var slide = slidePart.Slide ?? throw new InvalidOperationException("Corrupt file");
+        var shapeId = shape.NonVisualShapeProperties?.NonVisualDrawingProperties?.Id?.Value
+            ?? throw new ArgumentException("Shape has no ID");
+
+        EnsureTimingTree(slide, out var mainSeqCTn, out var bldLst);
+        var timing = slide.GetFirstChild<Timing>()!;
+        var nextId = GetMaxTimingId(timing) + 1;
+        var grpId = GetMaxGrpId(timing);
+
+        var nodeType = trigger switch
+        {
+            AnimTrigger.AfterPrevious => TimeNodeValues.AfterEffect,
+            AnimTrigger.WithPrevious  => TimeNodeValues.WithEffect,
+            _                         => TimeNodeValues.ClickEffect
+        };
+        var outerDelay = trigger == AnimTrigger.OnClick ? "indefinite" : "0";
+
+        var motionGroup = BuildMotionPathGroup(
+            shapeId.ToString(), durationMs, nodeType, grpId, outerDelay,
+            NormaliseMotionPath(pathString), ref nextId,
+            delayMs, easingAccel, easingDecel);
+
+        if (trigger == AnimTrigger.WithPrevious)
+        {
+            var lastGroup = mainSeqCTn.ChildTimeNodeList!
+                .Elements<ParallelTimeNode>().LastOrDefault();
+            if (lastGroup?.CommonTimeNode?.ChildTimeNodeList != null)
+            {
+                var midPar = motionGroup.CommonTimeNode?.ChildTimeNodeList?.FirstChild;
+                if (midPar != null)
+                {
+                    midPar.Remove();
+                    lastGroup.CommonTimeNode.ChildTimeNodeList.AppendChild(midPar);
+                }
+                else mainSeqCTn.ChildTimeNodeList!.AppendChild(motionGroup);
+            }
+            else mainSeqCTn.ChildTimeNodeList!.AppendChild(motionGroup);
+        }
+        else
+        {
+            mainSeqCTn.ChildTimeNodeList!.AppendChild(motionGroup);
+        }
+
+        // BuildList entry so PowerPoint surfaces the shape under the animation pane.
+        var shapeIdStr = shapeId.ToString();
+        if (bldLst == null)
+        {
+            bldLst = new BuildList();
+            slide.GetFirstChild<Timing>()!.BuildList = bldLst;
+        }
+        if (!bldLst.Elements<BuildParagraph>()
+                .Any(b => b.ShapeId?.Value == shapeIdStr))
+        {
+            bldLst.AppendChild(new BuildParagraph
+            {
+                ShapeId = shapeIdStr,
+                GroupId = new UInt32Value((uint)grpId)
+            });
         }
     }
 
@@ -1300,6 +1962,34 @@ public partial class PowerPointHandler
     /// </summary>
     internal static string ResolveAnimEffectName(string filter, int presetId, string cls)
     {
+        // Emphasis presetIDs are the canonical signal (templates may embed an
+        // <p:animEffect filter="fade"> as part of a larger primitive list, e.g.
+        // Pulse uses filter="fade" + animScale). Resolve by preset id first.
+        if (cls == "emphasis")
+        {
+            var emphName = presetId switch
+            {
+                1  => "fillColor",
+                6  => "grow",  // PowerPoint's "Grow/Shrink" — readback uses short canonical name
+                7  => "lineColor",
+                8  => "spin",
+                9  => "transparency",
+                10 => "fade",
+                14 => "wave",
+                19 => "objectColor",
+                21 => "complementaryColor",
+                22 => "complementaryColor2",
+                23 => "contrastingColor",
+                24 => "darken",
+                25 => "desaturate",
+                26 => "pulse",
+                27 => "colorPulse",
+                30 => "lighten",
+                32 => "teeter",
+                _  => null
+            };
+            if (emphName != null) return emphName;
+        }
         return filter switch
         {
             var f when f.StartsWith("blinds")           => "blinds",
@@ -1319,15 +2009,7 @@ public partial class PowerPointHandler
             var f when f.StartsWith("wheel")            => "wheel",
             var f when f.StartsWith("wipe")             => "wipe",
             _ => cls == "emphasis"
-                ? presetId switch
-                {
-                    1  => "bold",
-                    10 => "fade",
-                    14 => "wave",
-                    26 => "grow",
-                    27 => "spin",
-                    _  => "unknown"
-                }
+                ? "unknown"  // emphasis preset id table handled at top of this method
                 : presetId switch
                 {
                     // Entrance/exit preset IDs (mirror GetAnimPreset table)
@@ -1358,9 +2040,9 @@ public partial class PowerPointHandler
         };
     }
 
-    private static void ReadShapeAnimation(SlidePart slidePart, Shape shape, OfficeCli.Core.DocumentNode node)
+    private static void ReadShapeAnimation(SlidePart slidePart, OpenXmlElement target, OfficeCli.Core.DocumentNode node)
     {
-        var shapeId = shape.NonVisualShapeProperties?.NonVisualDrawingProperties?.Id?.Value;
+        var shapeId = GetAnimationTargetSpId(target);
         if (shapeId == null) return;
 
         var timing = slidePart.Slide?.GetFirstChild<Timing>();
@@ -1450,6 +2132,24 @@ public partial class PowerPointHandler
                 cur = cur.Parent;
             }
         }
+
+        // chartBuild read-back: chart graphicFrames carry an extra <p:bldGraphic>
+        // entry in <p:bldLst>, optionally with <p:bldSub><a:bldChart bld="..."/>
+        // when the build is per-series/category. Surface as Format["chartBuild"].
+        // CONSISTENCY(animation-target): only relevant when the target is a chart
+        // graphicFrame; plain shapes get <p:bldP> and have no chartBuild key.
+        if (IsChartGraphicFrame(target))
+        {
+            var bldGraphic = timing.BuildList?
+                .Elements<BuildGraphics>()
+                .FirstOrDefault(b => b.ShapeId?.Value == shapeIdStr);
+            if (bldGraphic != null)
+            {
+                var bldChart = bldGraphic.BuildSubElement?.BuildChart;
+                var bldVal = bldChart?.Build?.Value;
+                node.Format["chartBuild"] = string.IsNullOrEmpty(bldVal) ? "asWhole" : bldVal;
+            }
+        }
     }
 
     /// <summary>
@@ -1462,19 +2162,27 @@ public partial class PowerPointHandler
     /// </summary>
     internal static void ReadSlideTransition(SlidePart slidePart, OfficeCli.Core.DocumentNode node)
     {
-        // First try SDK typed access
         var slide = slidePart.Slide;
-        var trans = slide?.Transition;
-        if (trans != null)
+        if (slide == null) return;
+
+        // Prefer the typed SDK path for bare <p:transition><p:wipe.../></p:transition>
+        // — it understands typed direction enums and surfaces canonical full-word
+        // forms (wipe-up, not wipe-u). Fall back to regex when:
+        //   1. slide.Transition is null (mc:AlternateContent wraps the real
+        //      transition for morph/p14/p15 — typed access returns null).
+        //   2. slide.Transition is non-null but ChildElements is empty —
+        //      happens in PublishTrimmed builds where the SDK strips unknown
+        //      elements (e.g. <p15:prstTrans>) from the typed object graph
+        //      even though they're still present in OuterXml.
+        var trans = slide.Transition;
+        if (trans != null &&
+            trans.ChildElements.Any(c => c.LocalName != "extLst"))
         {
-            ReadSlideTransition(slide!, node);
+            ReadSlideTransition(slide, node);
             return;
         }
 
-        // SDK typed access failed — try parsing from the slide's serialized XML.
-        // The OuterXml may contain the transition even when the typed property is null.
-        if (slide != null)
-            ParseTransitionFromXml(slide.OuterXml, node);
+        ParseTransitionFromXml(slide.OuterXml, node);
     }
 
     private static void ParseTransitionFromXml(string xml, OfficeCli.Core.DocumentNode node)
@@ -1512,15 +2220,76 @@ public partial class PowerPointHandler
                 return;
             }
 
+            // Look for p15 preset transitions: <p15:prstTrans prst="box" [invX="1"] [invY="1"]/>
+            // PowerPoint 2013+ stores box (and a wider gallery of "modern"
+            // transitions not yet routed by officecli) through this element.
+            // invX + invY together flip the box-in direction to box-out.
+            var p15Match = System.Text.RegularExpressions.Regex.Match(
+                mcInner, @"<p15:prstTrans(?:\s+([^/]*))?/?>");
+            if (p15Match.Success)
+            {
+                var p15Attrs = p15Match.Groups[1].Value;
+                var prstMatch = System.Text.RegularExpressions.Regex.Match(p15Attrs, @"prst=""(\w+)""");
+                if (prstMatch.Success)
+                {
+                    // Preserve the OOXML lowerCamelCase token (pageCurlDouble,
+                    // fallOver, etc.) on readback — the CLI accepts case-insensitive
+                    // input but Get's canonical form matches the spec spelling.
+                    var prst = prstMatch.Groups[1].Value;
+                    var invX = System.Text.RegularExpressions.Regex.IsMatch(p15Attrs, @"invX=""(1|true)""");
+                    // -out = invX flipped (the Left/Right direction toggle for
+                    // direction-sensitive p15 presets). invY exists in the
+                    // schema but PowerPoint's Effect Options never writes it
+                    // alongside invX, so we don't either.
+                    var canonical = invX ? $"{prst}-out" : prst;
+                    node.Format["transition"] = canonical;
+
+                    var transInMc = System.Text.RegularExpressions.Regex.Match(
+                        mcInner, @"<p:transition([^>]*?)(?:/>|>)");
+                    if (transInMc.Success)
+                    {
+                        var transAttrs = transInMc.Groups[1].Value;
+                        var spdM = System.Text.RegularExpressions.Regex.Match(transAttrs, @"spd=""(\w+)""");
+                        if (spdM.Success) node.Format["transitionSpeed"] = spdM.Groups[1].Value;
+                    }
+                    return;
+                }
+            }
+
             // Look for p14 transitions (vortex, switch, flip, etc.) with dir attribute
             var p14Match = System.Text.RegularExpressions.Regex.Match(mcInner, @"<p14:(\w+)(?:\s+([^/]*))?/?>");
             if (p14Match.Success)
             {
                 var typeName = p14Match.Groups[1].Value.ToLowerInvariant();
                 var p14Attrs = p14Match.Groups[2].Value;
-                var dirMatch = System.Text.RegularExpressions.Regex.Match(p14Attrs, @"dir=""(\w+)""");
-                if (dirMatch.Success && !IsDefaultP14Direction(typeName, dirMatch.Groups[1].Value.ToLowerInvariant()))
-                    typeName = $"{typeName}-{dirMatch.Groups[1].Value.ToLowerInvariant()}";
+
+                // p14:prism is reused for three UI tiles: bare = Cube,
+                // isContent=1 = Rotate, isContent=1 isInverted=1 = Orbit.
+                // Surface each on readback as its UI-name token so set
+                // transition=rotate/orbit round-trips.
+                if (typeName == "prism")
+                {
+                    var isC = System.Text.RegularExpressions.Regex.IsMatch(p14Attrs, @"isContent=""(1|true)""");
+                    var isI = System.Text.RegularExpressions.Regex.IsMatch(p14Attrs, @"isInverted=""(1|true)""");
+                    if (isC && isI) typeName = "orbit";
+                    else if (isC) typeName = "rotate";
+                    // bare prism stays as "prism" (canonical) — `cube` is an
+                    // input alias only, doesn't replace the readback.
+                }
+                else
+                {
+                    var dirMatch = System.Text.RegularExpressions.Regex.Match(p14Attrs, @"dir=""(\w+)""");
+                    if (dirMatch.Success && !IsDefaultP14Direction(typeName, dirMatch.Groups[1].Value.ToLowerInvariant()))
+                    {
+                        var rawDir = dirMatch.Groups[1].Value.ToLowerInvariant();
+                        // Expand single-letter slide-direction abbreviations so pan-u
+                        // reads back as pan-up and reveal-r as reveal-right. The raw
+                        // OOXML attribute uses single letters; the canonical readback
+                        // surface speaks full words (matches Get's contract for
+                        // wipe/push/cover via MapSlideDirection).
+                        typeName = $"{typeName}-{ExpandDirectionAbbreviation(rawDir) ?? rawDir}";
+                    }
+                }
                 node.Format["transition"] = typeName;
 
                 var transInMc = System.Text.RegularExpressions.Regex.Match(mcInner, @"<p:transition([^>]*?)(?:/>|>)");
@@ -1678,6 +2447,13 @@ public partial class PowerPointHandler
         if (transElem is RandomBarTransition rbar && rbar.Direction?.HasValue == true)
             return rbar.Direction.Value == DirectionValues.Vertical ? "vertical" : null;
 
+        // Wheel: surface non-default spoke count (default 4) as a numeric
+        // suffix so set transition=wheel-8 round-trips. Spokes are written
+        // unconditionally by the parser; only surface when ≠ 4 to keep bare
+        // 'wheel' as the canonical readback for the default form.
+        if (transElem is WheelTransition wheelT && wheelT.Spokes?.HasValue == true && wheelT.Spokes.Value != 4u)
+            return wheelT.Spokes.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
         // Corner direction: strips (default: rd/rightdown)
         if (transElem is StripsTransition strips && strips.Direction?.HasValue == true)
         {
@@ -1688,13 +2464,17 @@ public partial class PowerPointHandler
             if (cv == TransitionCornerDirectionValues.LeftDown) return "leftdown";
         }
 
-        // p14/p159 transitions: read dir attribute from XML (vortex, switch, flip, glitter, pan, doors, window)
+        // p14/p159 transitions: read dir attribute from XML (vortex, switch, flip, glitter, pan, doors, window, reveal, ferris, gallery, conveyor, shred, flythrough, warp)
         var dirAttr = transElem.GetAttributes().FirstOrDefault(a => a.LocalName == "dir");
         if (!string.IsNullOrEmpty(dirAttr.Value))
         {
             var d = dirAttr.Value.ToLowerInvariant();
             // Default for most p14 transitions is "l" or "left"
-            return d == "l" ? null : d;
+            if (d == "l") return null;
+            // Expand single-letter abbreviations (u/d/r) for slide-direction-style
+            // p14 transitions like pan/glitter so set transition=pan-up round-trips
+            // through Get as "pan-up" instead of leaking the raw OOXML "pan-u".
+            return ExpandDirectionAbbreviation(d) ?? d;
         }
 
         // Morph option attribute
@@ -1815,7 +2595,12 @@ public partial class PowerPointHandler
                         : "") +
                     "Supported entrance/exit effects: appear, fade, fly, zoom, wipe, bounce, float, split, " +
                     "wheel, swivel, checkerboard, blinds, dissolve, flash, box, circle, diamond, plus, strips, wedge, random. " +
-                    "Supported emphasis effects (require class=emphasis): spin, grow, bold, wave, fade. " +
+                    "Template-backed exit effects (verbatim PowerPoint OOXML): contract, centerRevolve, collapse, " +
+                    "floatOut, shrinkTurn, sinkDown, spinner, basicZoom, stretchy, boomerang, credits, " +
+                    "curveDown, pinwheel, spiralOut, basicSwivel. " +
+                    "Supported emphasis effects (require class=emphasis): spin, grow/growShrink/shrink, bold, wave, fade, " +
+                    "fillColor, lineColor, transparency, complementaryColor, complementaryColor2, contrastingColor, " +
+                    "darken, desaturate, lighten, objectColor, pulse, colorPulse, teeter. " +
                     "Use 'none' to remove.")
             };
         }
